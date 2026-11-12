@@ -5,7 +5,7 @@
   "description": "Playify Sports high-performance Cloudflare Edge Worker for multi-provider stream aggregation and caching",
   "main": "src/index.ts",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --port 3000 --ip 0.0.0.0 --show-interactive-dev-session=false",
     "build": "esbuild src/index.ts --bundle --format=esm --target=es2022 --outfile=dist/index.js",
     "deploy": "wrangler deploy",
     "test": "vitest run",
