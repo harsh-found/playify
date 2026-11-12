@@ -1,6 +1,9 @@
+import { HlsInspector } from "./hls-inspector";
+
 /**
  * Cloudflare Edge Cache API wrapper with in-memory fallback for local dev & testing.
- * Provides ETag generation, conditional 304 Not Modified responses, and bounded LRU eviction.
+ * Provides ETag generation, conditional 304 Not Modified responses, bounded LRU eviction,
+ * and real-time cache telemetry.
  */
 interface CacheEntry {
   body: string;
@@ -9,12 +12,48 @@ interface CacheEntry {
   expiry: number;
 }
 
+export interface CacheStats {
+  hits: number;
+  misses: number;
+  notModified304: number;
+  evictions: number;
+  currentEntries: number;
+  maxEntries: number;
+  hitRatePercent: number;
+}
+
 export class EdgeCache {
   private static memoryCache = new Map<string, CacheEntry>();
   private static MAX_MEMORY_ITEMS = 200;
+  private static generation = 1;
+
+  private static stats = {
+    hits: 0,
+    misses: 0,
+    notModified304: 0,
+    evictions: 0,
+  };
+
+  static getGeneration(): number {
+    return this.generation;
+  }
+
+  static getStats(): CacheStats {
+    const total = this.stats.hits + this.stats.notModified304 + this.stats.misses;
+    const hitRatePercent =
+      total > 0
+        ? Number((((this.stats.hits + this.stats.notModified304) / total) * 100).toFixed(2))
+        : 0;
+    return {
+      ...this.stats,
+      currentEntries: this.memoryCache.size,
+      maxEntries: this.MAX_MEMORY_ITEMS,
+      hitRatePercent,
+    };
+  }
 
   /**
-   * Fast, deterministic 32-bit hash for ETag calculation.
+   * Fast, deterministic 32-bit FNV-1a hash for ETag calculation.
    */
   static computeEtag(body: string): string {
     let hash = 2166136261;
@@ -41,6 +80,7 @@ export class EdgeCache {
         if (match) {
           const cachedEtag = match.headers.get("ETag");
           if (ifNoneMatch && cachedEtag && ifNoneMatch === cachedEtag) {
+            this.stats.notModified304 += 1;
             return new Response(null, {
               status: 304,
               statusText: "Not Modified",
@@ -48,6 +88,7 @@ export class EdgeCache {
             });
           }
 
+          this.stats.hits += 1;
           const headers = new Headers(match.headers);
           headers.set("X-Edge-Cache", "HIT");
           return new Response(match.body, {
@@ -68,6 +109,7 @@ export class EdgeCache {
         const headers = new Headers(item.headers);
 
         if (ifNoneMatch && item.etag && ifNoneMatch === item.etag) {
+          this.stats.notModified304 += 1;
           headers.set("X-Edge-Cache", "HIT-MEM-304");
           return new Response(null, {
             status: 304,
@@ -76,6 +118,7 @@ export class EdgeCache {
           });
         }
 
+        this.stats.hits += 1;
         headers.set("X-Edge-Cache", "HIT-MEM");
         // Re-insert to mark as recently used in LRU
         this.memoryCache.delete(key);
@@ -86,6 +129,7 @@ export class EdgeCache {
       this.memoryCache.delete(key);
     }
 
+    this.stats.misses += 1;
     return null;
   }
 
@@ -140,17 +184,19 @@ export class EdgeCache {
     }
 
     // Populate in-memory fallback with strict bounded LRU capacity (max 200 items)
-    if (this.memoryCache.size >= this.MAX_MEMORY_ITEMS) {
+    if (this.memoryCache.size >= this.MAX_MEMORY_ITEMS && !this.memoryCache.has(key)) {
       const now = Date.now();
       for (const [k, v] of this.memoryCache.entries()) {
         if (v.expiry <= now) {
           this.memoryCache.delete(k);
+          this.stats.evictions += 1;
         }
       }
       while (this.memoryCache.size >= this.MAX_MEMORY_ITEMS) {
         const oldestKey = this.memoryCache.keys().next().value;
         if (oldestKey) {
           this.memoryCache.delete(oldestKey);
+          this.stats.evictions += 1;
         } else {
           break;
         }
@@ -167,5 +213,13 @@ export class EdgeCache {
 
   static clearMemory(): void {
     this.memoryCache.clear();
+    this.generation += 1;
+    this.stats = {
+      hits: 0,
+      misses: 0,
+      notModified304: 0,
+      evictions: 0,
+    };
+    HlsInspector.clearCache();
   }
 }

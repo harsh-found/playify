@@ -36,11 +36,11 @@ describe("Edge Concurrency & Performance Benchmark Suite", () => {
   it("handles 30 concurrent catalog requests with single-flight request coalescing and zero race conditions", async () => {
     let speculativeFetchCount = 0;
     // Mock the inner speculativeFetch so UpstreamClient.coalesce operates naturally
-    vi.spyOn(UpstreamClient as any, "speculativeFetch").mockImplementation(async (path: string) => {
+    vi.spyOn(UpstreamClient as any, "speculativeFetch").mockImplementation(async (path: any) => {
       speculativeFetchCount++;
       // Simulate 15ms upstream network latency
       await new Promise((resolve) => setTimeout(resolve, 15));
-      if (path.includes("/catalog/")) {
+      if (String(path).includes("/catalog/")) {
         return mockCatalogData;
       }
       return mockStreamData;
@@ -70,8 +70,8 @@ describe("Edge Concurrency & Performance Benchmark Suite", () => {
   });
 
   it("handles 25 concurrent stream requests without race conditions or memory corruption", async () => {
-    vi.spyOn(UpstreamClient as any, "speculativeFetch").mockImplementation(async (path: string) => {
-      if (path.includes("/catalog/")) {
+    vi.spyOn(UpstreamClient as any, "speculativeFetch").mockImplementation(async (path: any) => {
+      if (String(path).includes("/catalog/")) {
         return mockCatalogData;
       }
       return mockStreamData;

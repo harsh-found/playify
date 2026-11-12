@@ -6,21 +6,23 @@ export interface ClearKeyEntry {
 export interface DrmConfiguration {
   type: "clearkey" | "widevine" | "none";
   keys?: ClearKeyEntry[];
+  licenseUrl?: string;
 }
 
 export interface StreamRendition {
-  qualityTag: string; // "Auto", "1080p", "720p", "480p", "360p"
+  qualityTag: string; // "Auto", "1080p", "720p", "576p", "540p", "480p", "396p", "360p"
   label: string; // "1080p FHD (50fps)"
   height: number;
   width: number;
   bitrate: number;
   fps: number;
+  codecs?: string;
   url: string;
   isDefault?: boolean;
 }
 
 export interface LanguageInfo {
-  code: string; // "hin", "eng", "ben"
+  code: string; // "hin", "eng", "ben", "tam", "tel", "urd", "spa", etc.
   name: string; // "Hindi", "English"
   badge: string; // "HIN", "ENG"
 }
@@ -78,6 +80,14 @@ export interface UnifiedStream {
   renditions: StreamRendition[];
 }
 
+export interface StreamFilterOptions {
+  language?: string;
+  quality?: string;
+  protocol?: string;
+  provider?: string;
+  inspectHls?: boolean;
+}
+
 export interface StreamResponse {
   status: "success";
   apiVersion: string;
@@ -94,6 +104,9 @@ export interface StreamResponse {
     totalRawStreamsFound: number;
     deduplicatedStreamsCount: number;
     recommendedDefaultStreamId: string;
+    availableLanguages?: string[];
+    availableQualities?: string[];
+    channelGroups?: string[];
     audit?: StreamAuditSummary;
   };
   streams: UnifiedStream[];

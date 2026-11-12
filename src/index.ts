@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { EdgeCache } from "./core/cache";
 import { Aggregator } from "./providers/aggregator";
 import { StreamProxy } from "./core/proxy";
+import { CatalogQueryOptions } from "./types/catalog.types";
 
 export const app = new Hono();
 
@@ -57,6 +58,61 @@ app.onError((err, c) => {
   );
 });
 
+// Helper to parse and validate catalog query parameters
+function parseCatalogQueryOptions(c: any): {
+  options: CatalogQueryOptions;
+  cacheKeySuffix: string;
+} {
+  const sport = c.req.query("sport");
+  const phase = c.req.query("phase");
+  const search = c.req.query("search") ?? c.req.query("q");
+  const kind = c.req.query("kind");
+  const tournament = c.req.query("tournament");
+  const provider = c.req.query("provider");
+  const hotRaw = c.req.query("hot");
+  const date = c.req.query("date");
+  const sort = c.req.query("sort") as CatalogQueryOptions["sort"];
+  const pageRaw = c.req.query("page");
+  const limitRaw = c.req.query("limit");
+  const offsetRaw = c.req.query("offset");
+
+  const hot = hotRaw === "true" || hotRaw === "1" ? true : undefined;
+  const page = pageRaw ? parseInt(pageRaw, 10) : undefined;
+  const limit = limitRaw ? parseInt(limitRaw, 10) : undefined;
+  const offset = offsetRaw ? parseInt(offsetRaw, 10) : undefined;
+
+  const hasExtra = Boolean(
+    kind ||
+      tournament ||
+      provider ||
+      hot !== undefined ||
+      date ||
+      sort ||
+      (limit !== undefined && !isNaN(limit))
+  );
+
+  const options: CatalogQueryOptions = {
+    sport,
+    phase,
+    search,
+    kind,
+    tournament,
+    provider,
+    hot,
+    date,
+    sort,
+    page: page !== undefined && !isNaN(page) ? page : undefined,
+    limit: limit !== undefined && !isNaN(limit) ? limit : undefined,
+    offset: offset !== undefined && !isNaN(offset) ? offset : undefined,
+  };
+
+  const cacheKeySuffix = hasExtra
+    ? `:${kind ?? ""}:${tournament ?? ""}:${provider ?? ""}:${hot ?? ""}:${date ?? ""}:${sort ?? ""}:${page ?? ""}:${limit ?? ""}:${offset ?? ""}`
+    : "";
+
+  return { options, cacheKeySuffix };
+}
+
 // 4. Root Discovery & Documentation
 app.get("/", (c) => {
   return c.json({
@@ -65,13 +121,24 @@ app.get("/", (c) => {
     architecture: "Edge-Federated Multi-Provider Engine",
     status: "healthy",
     providersIntegrated: Aggregator.CATALOG_DEFINITIONS.length,
+    providers: Aggregator.CATALOG_DEFINITIONS.map((p) => ({
+      key: p.key,
+      name: p.name,
+    })),
     endpoints: {
       unifiedCatalog: "/api/catalog",
       catalogBySport: "/api/catalog/:sport",
+      liveCenter: "/api/live",
+      upcomingSchedule: "/api/upcoming",
+      competitions: "/api/competitions",
+      competitionDetail: "/api/competitions/:id",
+      multiEntitySearch: "/api/search?q=<query>",
       fixtureLookup: "/api/fixture/:id",
       sportsExplore: "/api/sports",
       unifiedStream: "/api/stream/:fixtureKey",
       unifiedStreamsAlias: "/api/streams/:fixtureKey",
+      providersHealth: "/api/providers",
+      platformStats: "/api/stats",
       streamProxy: "/api/proxy?url=<target_m3u8_url>",
       health: "/health",
     },
@@ -94,17 +161,19 @@ app.get("/api/sports", async (c) => {
 
 // 6. Unified Sports Catalog API: /api/catalog?sport=cricket&phase=live&search=india
 app.get("/api/catalog", async (c) => {
-  const sport = c.req.query("sport");
-  const phase = c.req.query("phase");
-  const search = c.req.query("search");
-
-  const cacheKey = `catalog:unified:${sport ?? "all"}:${phase ?? "all"}:${search ?? ""}`;
+  const { options, cacheKeySuffix } = parseCatalogQueryOptions(c);
+  const cacheKey = `catalog:unified:${options.sport ?? "all"}:${options.phase ?? "all"}:${options.search ?? ""}${cacheKeySuffix}`;
   const cachedResponse = await EdgeCache.get(cacheKey, c.req.raw);
   if (cachedResponse) {
     return cachedResponse;
   }
 
-  const catalog = await Aggregator.getUnifiedCatalog(sport, phase, search);
+  const catalog = await Aggregator.getUnifiedCatalog(
+    options.sport,
+    options.phase,
+    options.search,
+    cacheKeySuffix ? options : undefined
+  );
   const response = c.json(catalog);
 
   // Dynamic TTL: 15s if live sports are active, 60s otherwise (only cache valid non-empty responses)
@@ -118,16 +187,20 @@ app.get("/api/catalog", async (c) => {
 // 7. Dedicated Sport Catalog: /api/catalog/:sport?search=arsenal
 app.get("/api/catalog/:sport", async (c) => {
   const sport = c.req.param("sport");
-  const phase = c.req.query("phase");
-  const search = c.req.query("search");
+  const { options, cacheKeySuffix } = parseCatalogQueryOptions(c);
 
-  const cacheKey = `catalog:sport:${sport}:${phase ?? "all"}:${search ?? ""}`;
+  const cacheKey = `catalog:sport:${sport}:${options.phase ?? "all"}:${options.search ?? ""}${cacheKeySuffix}`;
   const cachedResponse = await EdgeCache.get(cacheKey, c.req.raw);
   if (cachedResponse) {
     return cachedResponse;
   }
 
-  const catalog = await Aggregator.getUnifiedCatalog(sport, phase, search);
+  const catalog = await Aggregator.getUnifiedCatalog(
+    sport,
+    options.phase,
+    options.search,
+    cacheKeySuffix ? { ...options, sport } : undefined
+  );
   const response = c.json(catalog);
 
   if (catalog.fixtures.length > 0) {
@@ -137,10 +210,113 @@ app.get("/api/catalog/:sport", async (c) => {
   return response;
 });
 
-// 8. Direct Fixture Lookup: /api/fixture/:id
-app.get("/api/fixture/:id", async (c) => {
+// 8. Dedicated Live Events Center: /api/live
+app.get("/api/live", async (c) => {
+  const sport = c.req.query("sport");
+  const cacheKey = `live:center:${sport ?? "all"}`;
+  const cachedResponse = await EdgeCache.get(cacheKey, c.req.raw);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+
+  const liveData = await Aggregator.getLiveCenter(sport);
+  const response = c.json(liveData);
+  await EdgeCache.put(cacheKey, c.req.raw, response, 15);
+  return response;
+});
+
+// 9. Upcoming Schedule & Calendar API: /api/upcoming & /api/schedule
+const handleUpcomingRequest = async (c: any) => {
+  const sport = c.req.query("sport");
+  const hoursRaw = c.req.query("hours");
+  const hours = hoursRaw ? parseInt(hoursRaw, 10) : undefined;
+
+  const cacheKey = `upcoming:schedule:${sport ?? "all"}:${hours ?? "all"}`;
+  const cachedResponse = await EdgeCache.get(cacheKey, c.req.raw);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+
+  const schedule = await Aggregator.getUpcomingSchedule(
+    sport,
+    hours !== undefined && !isNaN(hours) ? hours : undefined
+  );
+  const response = c.json(schedule);
+  await EdgeCache.put(cacheKey, c.req.raw, response, 30);
+  return response;
+};
+
+app.get("/api/upcoming", handleUpcomingRequest);
+app.get("/api/schedule", handleUpcomingRequest);
+
+// 10. Competitions & Tournaments Discovery API: /api/competitions & /api/tournaments
+const handleCompetitionsRequest = async (c: any) => {
+  const sport = c.req.query("sport");
+  const phase = c.req.query("phase");
+  const cacheKey = `competitions:list:${sport ?? "all"}:${phase ?? "active"}`;
+  const cachedResponse = await EdgeCache.get(cacheKey, c.req.raw);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+
+  const competitions = await Aggregator.getCompetitions(sport, phase);
+  const response = c.json(competitions);
+  await EdgeCache.put(cacheKey, c.req.raw, response, 30);
+  return response;
+};
+
+app.get("/api/competitions", handleCompetitionsRequest);
+app.get("/api/tournaments", handleCompetitionsRequest);
+
+// 11. Single Competition / Tournament Detail API: /api/competitions/:id & /api/tournaments/:id
+const handleCompetitionDetailRequest = async (c: any) => {
   const id = c.req.param("id");
   const decodedId = decodeURIComponent(id);
+
+  const detail = await Aggregator.getCompetitionById(decodedId);
+  if (!detail) {
+    return c.json(
+      {
+        status: "error",
+        error: {
+          code: "COMPETITION_NOT_FOUND",
+          message: `Competition not found: ${decodedId}`,
+          id: decodedId,
+          timestamp: new Date().toISOString(),
+        },
+      },
+      404
+    );
+  }
+
+  return c.json(detail);
+};
+
+app.get("/api/competitions/:id", handleCompetitionDetailRequest);
+app.get("/api/tournaments/:id", handleCompetitionDetailRequest);
+
+// 12. Multi-Entity Search API: /api/search?q=india
+app.get("/api/search", async (c) => {
+  const q = c.req.query("q") ?? c.req.query("search") ?? "";
+  const cacheKey = `search:multi:${q.toLowerCase().trim()}`;
+  const cachedResponse = await EdgeCache.get(cacheKey, c.req.raw);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+
+  const results = await Aggregator.searchMultiEntity(q);
+  const response = c.json(results);
+  await EdgeCache.put(cacheKey, c.req.raw, response, 20);
+  return response;
+});
+
+// 13. Direct Fixture Lookup: /api/fixture/:id & /api/fixtures/:id
+const handleFixtureLookup = async (c: any) => {
+  const id = c.req.param("id");
+  const decodedId = decodeURIComponent(id);
+  const includeStreams =
+    c.req.query("includeStreams") === "true" ||
+    c.req.query("includeStreams") === "1";
 
   const fixture = await Aggregator.getFixtureById(decodedId);
   if (!fixture) {
@@ -158,25 +334,60 @@ app.get("/api/fixture/:id", async (c) => {
     );
   }
 
+  if (includeStreams) {
+    const streamData = await Aggregator.getUnifiedStreams(
+      fixture.canonicalKey,
+      fixture.providerPointers
+    );
+    return c.json({
+      status: "success",
+      apiVersion: "2.1.0",
+      fixture,
+      streams: streamData.streams,
+      streamSummary: streamData.summary,
+    });
+  }
+
   return c.json({
     status: "success",
     apiVersion: "2.1.0",
     fixture,
   });
-});
+};
 
-// 9. Unified Stream Studio API: /api/stream/:fixtureKey & /api/streams/:fixtureKey
+app.get("/api/fixture/:id", handleFixtureLookup);
+app.get("/api/fixtures/:id", handleFixtureLookup);
+
+// 14. Unified Stream Studio API: /api/stream/:fixtureKey & /api/streams/:fixtureKey
 const handleStreamRequest = async (c: any) => {
   const fixtureKey = c.req.param("fixtureKey");
   const decodedKey = decodeURIComponent(fixtureKey);
+  const language = c.req.query("language");
+  const quality = c.req.query("quality");
+  const protocol = c.req.query("protocol");
+  const provider = c.req.query("provider");
+  const inspectRaw = c.req.query("inspect");
+  const inspectHls =
+    inspectRaw === "false" || inspectRaw === "0" ? false : true;
 
-  const cacheKey = `stream:unified:${decodedKey}`;
+  const filterSuffix =
+    language || quality || protocol || provider || !inspectHls
+      ? `:${language ?? ""}:${quality ?? ""}:${protocol ?? ""}:${provider ?? ""}:${inspectHls}`
+      : "";
+
+  const cacheKey = `stream:unified:${decodedKey}${filterSuffix}`;
   const cachedResponse = await EdgeCache.get(cacheKey, c.req.raw);
   if (cachedResponse) {
     return cachedResponse;
   }
 
-  const streams = await Aggregator.getUnifiedStreams(decodedKey);
+  const streams = await Aggregator.getUnifiedStreams(
+    decodedKey,
+    undefined,
+    filterSuffix
+      ? { language, quality, protocol, provider, inspectHls }
+      : undefined
+  );
   const response = c.json(streams);
 
   // Cache streams for 30 seconds
@@ -187,15 +398,33 @@ const handleStreamRequest = async (c: any) => {
 app.get("/api/stream/:fixtureKey", handleStreamRequest);
 app.get("/api/streams/:fixtureKey", handleStreamRequest);
 
-// 9. Stream Header Masquerading & CORS Proxy: /api/proxy?url=...
+// 15. Provider Federation Health & Coverage Diagnostics: /api/providers
+app.get("/api/providers", async (c) => {
+  const report = await Aggregator.getProvidersReport();
+  return c.json(report);
+});
+
+// 16. Platform Observability & Reconciliation Diagnostics: /api/stats & /api/diagnostics
+const handleDiagnosticsRequest = async (c: any) => {
+  const diagnostics = await Aggregator.getPlatformDiagnostics();
+  return c.json(diagnostics);
+};
+
+app.get("/api/stats", handleDiagnosticsRequest);
+app.get("/api/diagnostics", handleDiagnosticsRequest);
+
+// 17. Stream Header Masquerading & CORS Proxy: /api/proxy?url=...
 app.get("/api/proxy", async (c) => {
   return StreamProxy.handleProxyRequest(c.req.raw);
 });
 
-// 10. Edge Health Diagnostics
+// 18. Edge Health Diagnostics
 app.get("/health", (c) => {
-  const cf = (c.req.raw as unknown as { cf?: { colo?: string; country?: string; city?: string } })
-    .cf;
+  const cf = (
+    c.req.raw as unknown as {
+      cf?: { colo?: string; country?: string; city?: string };
+    }
+  ).cf;
 
   return c.json({
     status: "ok",
@@ -205,6 +434,7 @@ app.get("/health", (c) => {
       country: cf?.country ?? "IN",
       city: cf?.city ?? "Local-PoP",
     },
+    cache: EdgeCache.getStats(),
     version: "2.1.0",
     service: "playify-edge",
   });

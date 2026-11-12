@@ -66,6 +66,8 @@ export interface UnifiedFixture {
     ageGroup?: string;
   };
   providerPointers: Record<string, string>;
+  providerRawIds?: Record<string, string[]>;
+  providerCount?: number;
 }
 
 export interface SportFacet {
@@ -74,6 +76,47 @@ export interface SportFacet {
   icon: string;
   liveCount: number;
   totalCount: number;
+  upcomingCount?: number;
+  endedCount?: number;
+}
+
+export interface PaginationMetadata {
+  totalItems: number;
+  returnedItems: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+}
+
+export interface CatalogQueryOptions {
+  sport?: string;
+  phase?: string;
+  search?: string;
+  kind?: string;
+  tournament?: string;
+  provider?: string;
+  hot?: boolean;
+  date?: string;
+  sort?: "default" | "smart" | "time_asc" | "time_desc" | "popularity" | "title_asc";
+  page?: number;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ReconciliationSummary {
+  totalProvidersQueried: number;
+  healthyProvidersCount: number;
+  totalRawItemsExtracted: number;
+  totalUnifiedFixtures: number;
+  activeUnifiedFixtures: number;
+  endedUnifiedFixtures: number;
+  multiProviderFixturesCount: number;
+  deduplicatedItemsMerged: number;
+  reconciledCrossFormatCount: number;
+  reconciledNearTimeCount: number;
+  unmappedRawItemsCount: number;
 }
 
 export interface CatalogResponse {
@@ -91,6 +134,61 @@ export interface CatalogResponse {
     sports: SportFacet[];
     totalLiveMatches: number;
     totalUpcomingMatches: number;
+    totalEndedMatches?: number;
   };
+  pagination?: PaginationMetadata;
+  reconciliation?: ReconciliationSummary;
   fixtures: UnifiedFixture[];
+}
+
+export interface CompetitionSummary {
+  id: string;
+  name: string;
+  shortName: string;
+  sportCategory: string;
+  sportLabel: string;
+  logo: string;
+  liveMatchesCount: number;
+  upcomingMatchesCount: number;
+  endedMatchesCount: number;
+  totalFixturesCount: number;
+  providers: string[];
+  sampleTeams: string[];
+  nextMatchTimeUtc?: string;
+}
+
+export interface CompetitionsResponse {
+  status: "success";
+  apiVersion: string;
+  timestamp: string;
+  totalCompetitions: number;
+  competitions: CompetitionSummary[];
+}
+
+export interface CompetitionDetailResponse {
+  status: "success";
+  apiVersion: string;
+  timestamp: string;
+  competition: CompetitionSummary;
+  fixtures: UnifiedFixture[];
+}
+
+export interface SearchEntityResult {
+  status: "success";
+  apiVersion: string;
+  timestamp: string;
+  query: string;
+  executionTimeMs: number;
+  counts: {
+    fixtures: number;
+    teams: number;
+    competitions: number;
+    broadcasters: number;
+  };
+  results: {
+    fixtures: UnifiedFixture[];
+    teams: Array<TeamEntity & { sportCategory: string; activeFixturesCount: number }>;
+    competitions: CompetitionSummary[];
+    broadcasters: Array<{ name: string; activeFixturesCount: number; sports: string[] }>;
+  };
 }

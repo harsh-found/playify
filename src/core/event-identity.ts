@@ -1,7 +1,8 @@
 /**
  * Multi-dimensional sport event identity parser for Playify Edge.
  * Extracts format, match number, tournament stage, gender, and age categories
- * to ensure zero false collisions between same-team series/tour fixtures.
+ * to ensure zero false collisions between same-team series/tour fixtures
+ * while enabling cross-provider reconciliation when one provider omits format tags.
  */
 
 export interface EventIdentity {
@@ -19,9 +20,15 @@ export class EventIdentityEngine {
   private static CRICKET_FORMAT_RULES: Array<{ format: string; regex: RegExp }> = [
     { format: "t10", regex: /\b(?:t10|ten\s*10|10\s*overs?)\b/i },
     { format: "the_hundred", regex: /\b(?:the\s*hundred|100\s*balls?)\b/i },
-    { format: "t20", regex: /\b(?:t20i?|twenty\s*20|20\s*overs?|ipl|psl|bbl|wbbl|cpl|npl|bpl|smat)\b/i },
+    {
+      format: "t20",
+      regex: /\b(?:t20i?|twenty\s*20|20\s*overs?|ipl|psl|bbl|wbbl|wpl|cpl|npl|bpl|smat|sa20|ilt20|mlc)\b/i,
+    },
     { format: "odi", regex: /\b(?:odi|one\s*day(?:\s*international)?|50\s*overs?)\b/i },
-    { format: "test", regex: /\b(?:test(?:\s*match|\s*series)?|ashes|ranji|sheffield\s*shield|first\s*class)\b/i },
+    {
+      format: "test",
+      regex: /\b(?:test(?:\s*match|\s*series|\s*championship)?|world\s*test\s*championship|wtc|ashes|ranji|sheffield\s*shield|county\s*championship|first\s*class)\b/i,
+    },
   ];
 
   // Motorsport Sessions
@@ -32,7 +39,7 @@ export class EventIdentityEngine {
     { format: "sprint_shootout", regex: /\b(?:sprint\s*shootout|sprint\s*qualifying)\b/i },
     { format: "sprint", regex: /\b(?:sprint(?:\s*race)?)\b/i },
     { format: "qualifying", regex: /\b(?:qualifying|q1|q2|q3|pole\s*position)\b/i },
-    { format: "race", regex: /\b(?:grand\s*prix|main\s*race|race\s*day)\b/i },
+    { format: "race", regex: /\b(?:grand\s*prix|main\s*race|race\s*day|\brace\b)\b/i },
   ];
 
   // Match Numbers (1st, 2nd, 3rd, Match 14, Game 3)
@@ -51,7 +58,10 @@ export class EventIdentityEngine {
     { stage: "qualifier", regex: /\b(?:qualifier\s*[12]|preliminary)\b/i },
     { stage: "eliminator", regex: /\b(?:eliminator(?:\s*[12])?)\b/i },
     { stage: "third_place", regex: /\b(?:3rd\s*place|third\s*place|bronze\s*match)\b/i },
-    { stage: "final", regex: /(?<!semi\s*|quarter\s*|semi-|quarter-)\b(?:the\s*final|grand\s*final|\bfinal\b)(?!\s*(?:four|eight))\b/i },
+    {
+      stage: "final",
+      regex: /(?<!semi\s*|quarter\s*|semi-|quarter-)\b(?:the\s*final|grand\s*final|\bfinal\b)(?!\s*(?:four|eight))\b/i,
+    },
     { stage: "playoff", regex: /\b(?:playoffs?|play-offs?)\b/i },
     { stage: "group_stage", regex: /\b(?:group\s*stage|round\s*of\s*16|round\s*of\s*32)\b/i },
   ];
@@ -62,9 +72,12 @@ export class EventIdentityEngine {
   static parse(text: string, sportCategory?: string): EventIdentity {
     const clean = text.toLowerCase();
 
-    // 1. Gender Detection
+    // 1. Gender Detection (including country-code -W suffixes and international terms)
     let gender: "men" | "women" | undefined;
-    if (/\b(?:women|women's|womens|\bwbbl\b|\bwpl\b|ucl\s*womens?)\b/i.test(clean)) {
+    if (
+      /\b(?:women|women's|womens|\bwbbl\b|\bwpl\b|ucl\s*womens?|femenino|f[eé]minin|frauen)\b/i.test(clean) ||
+      /(?:^|\s)[a-z]{2,4}-w\b/i.test(clean)
+    ) {
       gender = "women";
     } else if (/\b(?:men|men's|mens)\b/i.test(clean)) {
       gender = "men";
@@ -72,18 +85,25 @@ export class EventIdentityEngine {
 
     // 2. Age Group Detection
     let ageGroup: string | undefined;
-    if (/\b(?:under\s*19|under-19|u\s*19|u-19)\b/i.test(clean)) {
+    if (/\b(?:under[\s-]*17|u[\s-]*17)\b/i.test(clean) || /-u17\b/i.test(clean)) {
+      ageGroup = "u17";
+    } else if (/\b(?:under[\s-]*19|u[\s-]*19)\b/i.test(clean) || /-u19\b/i.test(clean)) {
       ageGroup = "u19";
-    } else if (/\b(?:under\s*21|under-21|u\s*21|u-21)\b/i.test(clean)) {
+    } else if (/\b(?:under[\s-]*20|u[\s-]*20)\b/i.test(clean) || /-u20\b/i.test(clean)) {
+      ageGroup = "u20";
+    } else if (/\b(?:under[\s-]*21|u[\s-]*21)\b/i.test(clean) || /-u21\b/i.test(clean)) {
       ageGroup = "u21";
-    } else if (/\b(?:under\s*23|under-23|u\s*23|u-23)\b/i.test(clean)) {
+    } else if (/\b(?:under[\s-]*23|u[\s-]*23)\b/i.test(clean) || /-u23\b/i.test(clean)) {
       ageGroup = "u23";
     }
 
     // 3. Format Detection
     let format: string | undefined;
-    const isMotorsport = sportCategory === "motorsport" || /\b(f1|formula\s*1|motogp)\b/i.test(clean);
-    const isCricket = sportCategory === "cricket" || /\b(cricket|t20|odi|test|ipl|bbl|psl)\b/i.test(clean);
+    const isMotorsport =
+      sportCategory === "motorsport" || /\b(f1|formula\s*1|motogp)\b/i.test(clean);
+    const isCricket =
+      sportCategory === "cricket" ||
+      /\b(cricket|t20|odi|test|ipl|bbl|wbbl|psl|wtc)\b/i.test(clean);
 
     if (isMotorsport) {
       for (const rule of this.MOTORSPORT_SESSION_RULES) {
@@ -142,5 +162,22 @@ export class EventIdentityEngine {
       ageGroup,
       canonicalDiscriminator,
     };
+  }
+
+  /**
+   * Checks whether two EventIdentity objects are compatible for cross-provider reconciliation.
+   * Returns false if both specify a given dimension (format, matchNumber, stage, ageGroup, gender)
+   * with conflicting values (e.g. "test" vs "t20", or "m1" vs "m2", or "semi_final" vs "final").
+   * Returns true if dimensions match or if one provider simply omitted a dimension.
+   */
+  static areCompatible(a: EventIdentity, b: EventIdentity): boolean {
+    if (a.format && b.format && a.format !== b.format) return false;
+    if (a.matchNumber && b.matchNumber && a.matchNumber !== b.matchNumber) return false;
+    if (a.stage && b.stage && a.stage !== b.stage) return false;
+    if (a.ageGroup && b.ageGroup && a.ageGroup !== b.ageGroup) return false;
+    if (a.gender && b.gender && a.gender !== b.gender) return false;
+    // Age group mismatch (e.g. U19 vs Senior) should not merge unless both have ageGroup or neither does
+    if (Boolean(a.ageGroup) !== Boolean(b.ageGroup)) return false;
+    return true;
   }
 }

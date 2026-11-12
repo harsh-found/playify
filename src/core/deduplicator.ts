@@ -22,6 +22,18 @@ export class StreamDeduplicator {
     "join channel",
   ];
 
+  private static RESOLUTION_DIMENSIONS: Record<string, { width: number; height: number }> = {
+    "4K": { width: 3840, height: 2160 },
+    "1080p": { width: 1920, height: 1080 },
+    "720p": { width: 1280, height: 720 },
+    "576p": { width: 1024, height: 576 },
+    "540p": { width: 960, height: 540 },
+    "480p": { width: 854, height: 480 },
+    "396p": { width: 704, height: 396 },
+    "360p": { width: 640, height: 360 },
+    "288p": { width: 512, height: 288 },
+  };
+
   /**
    * Identifies donation spam, promotional banners, or invalid candidates.
    */
@@ -93,6 +105,7 @@ export class StreamDeduplicator {
           !lowerKey.includes("session") &&
           !lowerKey.includes("auth") &&
           !lowerKey.includes("sig") &&
+          !lowerKey.startsWith("h_") &&
           lowerKey !== "h" &&
           lowerKey !== "t"
         ) {
@@ -113,7 +126,7 @@ export class StreamDeduplicator {
   }
 
   /**
-   * Extracts quality variant (e.g. 1080p, 720p, 576p, 396p, Auto).
+   * Extracts quality variant (e.g. 4K, 1080p, 720p, 576p, 540p, 480p, 396p, 360p, 288p, Auto).
    */
   static extractQualityVariant(text: string, url: string): string {
     try {
@@ -124,6 +137,7 @@ export class StreamDeduplicator {
       }
     } catch {}
     const t = text.toLowerCase();
+    if (/\b(?:2160p|4k|uhd)\b/.test(t)) return "4K";
     if (/\b(?:1080p|fhd|1080)\b/.test(t)) return "1080p";
     if (/\b(?:720p|hd|720)\b/.test(t)) return "720p";
     if (/\b(?:576p|576)\b/.test(t)) return "576p";
@@ -131,7 +145,51 @@ export class StreamDeduplicator {
     if (/\b(?:480p|480)\b/.test(t)) return "480p";
     if (/\b(?:396p|396)\b/.test(t)) return "396p";
     if (/\b(?:360p|360)\b/.test(t)) return "360p";
+    if (/\b(?:288p|288)\b/.test(t)) return "288p";
     return "Auto";
+  }
+
+  /**
+   * Extracts estimated bitrate in bps from scraper title (e.g. "~8.3 Mbps" -> 8300000).
+   */
+  static extractBitrateBps(text: string): number {
+    const mbpsMatch = text.match(/~?([\d.]+)\s*mbps/i);
+    if (mbpsMatch) {
+      const val = parseFloat(mbpsMatch[1]);
+      if (!isNaN(val) && val > 0) return Math.round(val * 1_000_000);
+    }
+    const kbpsMatch = text.match(/~?([\d.]+)\s*kbps/i);
+    if (kbpsMatch) {
+      const val = parseFloat(kbpsMatch[1]);
+      if (!isNaN(val) && val > 0) return Math.round(val * 1_000);
+    }
+    return 0;
+  }
+
+  /**
+   * Extracts embedded header overrides (h_User-Agent, h_Referer, h_Origin) from proxy URLs.
+   */
+  static extractHeaders(
+    url: string,
+    proxyHeaders?: Record<string, string>
+  ): Record<string, string> {
+    const headers: Record<string, string> = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      ...(proxyHeaders || {}),
+    };
+    try {
+      const u = new URL(url);
+      for (const [k, v] of u.searchParams.entries()) {
+        if (k.toLowerCase() === "h_user-agent" && v) {
+          headers["User-Agent"] = v;
+        } else if (k.toLowerCase() === "h_referer" && v) {
+          headers["Referer"] = v;
+        } else if (k.toLowerCase() === "h_origin" && v) {
+          headers["Origin"] = v;
+        }
+      }
+    } catch {}
+    return headers;
   }
 
   /**
@@ -150,7 +208,8 @@ export class StreamDeduplicator {
       url.includes("tapmad.com") ||
       url.includes("msnetworks.net") ||
       url.includes("pv-cdn.net") ||
-      url.includes("aiv-cdn.net")
+      url.includes("aiv-cdn.net") ||
+      url.includes("tamashaweb.com")
     ) {
       score += 0.10;
     }
@@ -180,11 +239,29 @@ export class StreamDeduplicator {
     if (lower.includes("[kan]") || lower.includes("kannada") || lower.includes("(kan)")) {
       return { code: "kan", name: "Kannada", badge: "KAN" };
     }
+    if (lower.includes("[mal]") || lower.includes("malayalam") || lower.includes("(mal)")) {
+      return { code: "mal", name: "Malayalam", badge: "MAL" };
+    }
+    if (lower.includes("[mar]") || lower.includes("marathi") || lower.includes("(mar)")) {
+      return { code: "mar", name: "Marathi", badge: "MAR" };
+    }
     if (lower.includes("[urd]") || lower.includes("urdu") || lower.includes("(urd)")) {
       return { code: "urd", name: "Urdu", badge: "URD" };
     }
     if (lower.includes("[spa]") || lower.includes("espanol") || lower.includes("spanish")) {
       return { code: "spa", name: "Spanish", badge: "SPA" };
+    }
+    if (lower.includes("[ara]") || lower.includes("arabic") || lower.includes("(ara)")) {
+      return { code: "ara", name: "Arabic", badge: "ARA" };
+    }
+    if (lower.includes("[fra]") || lower.includes("french") || lower.includes("francais")) {
+      return { code: "fra", name: "French", badge: "FRA" };
+    }
+    if (lower.includes("[por]") || lower.includes("portuguese") || lower.includes("portugues")) {
+      return { code: "por", name: "Portuguese", badge: "POR" };
+    }
+    if (lower.includes("[deu]") || lower.includes("german") || lower.includes("deutsch")) {
+      return { code: "deu", name: "German", badge: "DEU" };
     }
     return { code: "eng", name: "English", badge: "ENG" };
   }
@@ -276,12 +353,24 @@ export class StreamDeduplicator {
         existing.confidenceTier = updatedConfidence.tier;
       } else {
         const streamId = `feed_${Math.abs(this.hashString(fingerprint)).toString(16)}`;
-        const headers = item.behaviorHints?.proxyHeaders?.request || {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        };
+        const headers = this.extractHeaders(url, item.behaviorHints?.proxyHeaders?.request);
 
-        const isDash = url.includes(".mpd") || combinedTitle.includes("DASH");
-        const protocol: "hls" | "dash" = isDash ? "dash" : "hls";
+        let pathname = "";
+        try {
+          pathname = new URL(url).pathname.toLowerCase();
+        } catch {
+          pathname = url.split("?")[0].toLowerCase();
+        }
+
+        const isHlsPath = pathname.endsWith(".m3u8");
+        const isMp4Path = pathname.endsWith(".mp4");
+        const isDash =
+          !isHlsPath && (pathname.endsWith(".mpd") || url.includes(".mpd") || combinedTitle.includes("DASH"));
+        const protocol: "hls" | "dash" | "mp4" = isMp4Path
+          ? "mp4"
+          : isDash
+          ? "dash"
+          : "hls";
 
         // Parse DRM from explicit property, URL, and title
         const drm = DrmDetector.detectDrm(
@@ -294,6 +383,13 @@ export class StreamDeduplicator {
           false,
           drm !== null
         );
+
+        const dims = this.RESOLUTION_DIMENSIONS[qualityVariant] || { width: 0, height: 0 };
+        const bitrate = this.extractBitrateBps(combinedTitle);
+        const refererParam = headers["Referer"]
+          ? `&referer=${encodeURIComponent(headers["Referer"])}`
+          : "";
+        const edgeProxyFallbackUrl = `/api/proxy?url=${encodeURIComponent(url)}${refererParam}`;
 
         fingerprintMap.set(fingerprint, {
           streamId,
@@ -309,6 +405,7 @@ export class StreamDeduplicator {
           drm,
           network: {
             masterPlaylistUrl: url,
+            edgeProxyFallbackUrl,
             requiredHeaders: headers,
           },
           provenance: {
@@ -330,11 +427,14 @@ export class StreamDeduplicator {
           renditions: [
             {
               qualityTag: qualityVariant !== "Auto" ? qualityVariant : "Auto",
-              label: qualityVariant !== "Auto" ? `${qualityVariant} (Adaptive)` : "Auto (Adaptive)",
-              height: 0,
-              width: 0,
-              bitrate: 0,
-              fps: 0,
+              label:
+                qualityVariant !== "Auto"
+                  ? `${qualityVariant} (Adaptive)`
+                  : "Auto (Adaptive)",
+              height: dims.height,
+              width: dims.width,
+              bitrate,
+              fps: dims.height >= 720 ? 50 : dims.height > 0 ? 30 : 0,
               url,
               isDefault: true,
             },

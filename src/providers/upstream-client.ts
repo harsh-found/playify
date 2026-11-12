@@ -8,6 +8,19 @@ import {
 interface CircuitBreakerState {
   failures: number;
   lastFailureTime: number;
+  successes?: number;
+  lastLatencyMs?: number;
+}
+
+export interface ProviderFetchTelemetry {
+  catalogId: string;
+  lastLatencyMs: number;
+  avgLatencyMs: number;
+  lastItemCount: number;
+  totalFetches: number;
+  totalFailures: number;
+  lastSuccessAt?: string;
+  status: "healthy" | "degraded" | "offline";
 }
 
 export class UpstreamClient {
@@ -18,6 +31,10 @@ export class UpstreamClient {
 
   private static inFlightRequests = new Map<string, Promise<any>>();
   private static hostStates = new Map<string, CircuitBreakerState>();
+  private static providerMetrics = new Map<string, ProviderFetchTelemetry>();
+
+  private static totalRequests = 0;
+  private static coalescedHits = 0;
 
   private static CIRCUIT_BREAKER_THRESHOLD = 3;
   private static CIRCUIT_BREAKER_RESET_MS = 60_000; // 1 minute cooldown
@@ -26,8 +43,10 @@ export class UpstreamClient {
    * In-flight promise coalescing: deduplicates concurrent requests with the same key.
    */
   static async coalesce<T>(key: string, fetcher: () => Promise<T>): Promise<T> {
+    this.totalRequests += 1;
     const existing = this.inFlightRequests.get(key);
     if (existing) {
+      this.coalescedHits += 1;
       return existing as Promise<T>;
     }
 
@@ -43,7 +62,7 @@ export class UpstreamClient {
    * Circuit breaker failure recorder.
    */
   static recordFailure(host: string): void {
-    const state = this.hostStates.get(host) || { failures: 0, lastFailureTime: 0 };
+    const state = this.hostStates.get(host) || { failures: 0, lastFailureTime: 0, successes: 0 };
     state.failures += 1;
     state.lastFailureTime = Date.now();
     this.hostStates.set(host, state);
@@ -52,8 +71,20 @@ export class UpstreamClient {
   /**
    * Circuit breaker success recorder.
    */
-  static recordSuccess(host: string): void {
-    this.hostStates.delete(host);
+  static recordSuccess(host: string, latencyMs?: number): void {
+    const prev = this.hostStates.get(host);
+    if (prev && prev.failures > 0) {
+      this.hostStates.delete(host);
+    } else if (latencyMs !== undefined) {
+      this.hostStates.set(host, {
+        failures: 0,
+        lastFailureTime: 0,
+        successes: (prev?.successes || 0) + 1,
+        lastLatencyMs: latencyMs,
+      });
+    } else {
+      this.hostStates.delete(host);
+    }
   }
 
   /**
@@ -70,6 +101,38 @@ export class UpstreamClient {
       return false;
     }
     return true;
+  }
+
+  /**
+   * Returns real-time diagnostics for upstream hosts, request coalescing, and provider catalogs.
+   */
+  static getDiagnostics() {
+    const hosts = this.UPSTREAM_HOSTS.map((host) => {
+      const state = this.hostStates.get(host);
+      const healthy = this.isHostHealthy(host);
+      let circuitState: "closed" | "open" | "half-open" = "closed";
+      if (state && state.failures >= this.CIRCUIT_BREAKER_THRESHOLD) {
+        circuitState = healthy ? "half-open" : "open";
+      }
+      return {
+        host,
+        healthy,
+        circuitState,
+        consecutiveFailures: state?.failures || 0,
+        lastFailureTime: state?.lastFailureTime
+          ? new Date(state.lastFailureTime).toISOString()
+          : null,
+        lastLatencyMs: state?.lastLatencyMs ?? null,
+      };
+    });
+
+    return {
+      totalRequests: this.totalRequests,
+      coalescedHits: this.coalescedHits,
+      inFlightCount: this.inFlightRequests.size,
+      hosts,
+      providerMetrics: Object.fromEntries(this.providerMetrics.entries()),
+    };
   }
 
   /**
@@ -156,6 +219,7 @@ export class UpstreamClient {
       parentSignal.addEventListener("abort", abortHandler);
     }
 
+    const start = Date.now();
     try {
       const resp = await fetch(`${host}${path}`, {
         signal: controller.signal,
@@ -167,7 +231,7 @@ export class UpstreamClient {
 
       if (resp.ok) {
         const data = await resp.json();
-        this.recordSuccess(host);
+        this.recordSuccess(host, Date.now() - start);
         return data;
       } else {
         this.recordFailure(host);
@@ -189,14 +253,36 @@ export class UpstreamClient {
   }
 
   /**
-   * Fetches an individual catalog across federated upstream hosts with coalescing.
+   * Fetches an individual catalog across federated upstream hosts with coalescing and telemetry.
    */
   static async fetchCatalog(catalogId: string): Promise<UpstreamMeta[]> {
     const cacheKey = `upstream:catalog:${catalogId}`;
     return this.coalesce(cacheKey, async () => {
+      const start = Date.now();
       const path = `/catalog/tv/${catalogId}.json`;
       const data = await this.speculativeFetch(path, 8000, 1800);
-      return validateUpstreamMetas(data?.metas);
+      const latency = Date.now() - start;
+      const valid = validateUpstreamMetas(data?.metas);
+
+      const prev = this.providerMetrics.get(catalogId);
+      const totalFetches = (prev?.totalFetches || 0) + 1;
+      const totalFailures = (prev?.totalFailures || 0) + (data ? 0 : 1);
+      const avgLatencyMs = prev
+        ? Math.round((prev.avgLatencyMs * prev.totalFetches + latency) / totalFetches)
+        : latency;
+
+      this.providerMetrics.set(catalogId, {
+        catalogId,
+        lastLatencyMs: latency,
+        avgLatencyMs,
+        lastItemCount: valid.length,
+        totalFetches,
+        totalFailures,
+        lastSuccessAt: data ? new Date().toISOString() : prev?.lastSuccessAt,
+        status: valid.length > 0 ? "healthy" : data ? "degraded" : "offline",
+      });
+
+      return valid;
     });
   }
 
