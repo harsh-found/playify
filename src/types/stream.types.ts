@@ -27,12 +27,19 @@ export interface LanguageInfo {
   badge: string; // "HIN", "ENG"
 }
 
+export interface StreamMirrorUrl {
+  providerKey: string;
+  providerName: string;
+  url: string;
+}
+
 export interface StreamNetworkInfo {
   masterPlaylistUrl: string;
   directOriginUrl?: string | null;
   isBridgedStream?: boolean;
   edgeProxyFallbackUrl?: string | null;
   requiredHeaders?: Record<string, string>;
+  mirrorUrls?: StreamMirrorUrl[];
 }
 
 export interface StreamPlaybackHints {
@@ -123,6 +130,7 @@ export interface StreamFilterOptions {
   protocol?: string;
   provider?: string;
   channel?: string;
+  tier?: "primary" | "secondary" | "tertiary";
   drmFree?: boolean;
   playableOn?: "web_hls" | "all";
   inspectHls?: boolean;

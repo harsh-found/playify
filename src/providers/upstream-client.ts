@@ -5,6 +5,7 @@ import {
   validateUpstreamMetasWithAudit,
   validateUpstreamStreams,
 } from "../types/upstream.types";
+import { API_VERSION } from "../types/catalog.types";
 
 interface CircuitBreakerState {
   failures: number;
@@ -244,7 +245,7 @@ export class UpstreamClient {
       const resp = await fetch(`${host}${path}`, {
         signal: controller.signal,
         headers: {
-          "User-Agent": "PlayifyEdgeWorker/2.1.0 (Cloudflare Edge)",
+          "User-Agent": `PlayifyEdgeWorker/${API_VERSION} (Cloudflare Edge)`,
           Accept: "application/json",
         },
       });

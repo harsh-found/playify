@@ -242,7 +242,15 @@ export class StreamDeduplicator {
         .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
         .join("&");
 
-      return `${u.protocol}//${u.hostname.toLowerCase()}${u.pathname}${
+      let canonicalHost = u.hostname.toLowerCase();
+      if (
+        canonicalHost === "otte.cache.aiv-cdn.net" ||
+        canonicalHost === "otte.live.fly.ww.aiv-cdn.net"
+      ) {
+        canonicalHost = "otte.aiv-cdn.net";
+      }
+
+      return `${u.protocol}//${canonicalHost}${u.pathname}${
         cleanSearch ? "?" + cleanSearch : ""
       }`;
     } catch {
@@ -381,8 +389,12 @@ export class StreamDeduplicator {
   /**
    * Cleans display title into a polished TV channel title (e.g. "Willow Cricket HD").
    */
-  static cleanChannelName(rawName?: string, rawTitle?: string): { name: string; group: string } {
-    return ChannelNormalizer.normalize(rawName, rawTitle);
+  static cleanChannelName(
+    rawName?: string,
+    rawTitle?: string,
+    url?: string
+  ): { name: string; group: string } {
+    return ChannelNormalizer.normalize(rawName, rawTitle, url);
   }
 
   /**
@@ -490,7 +502,8 @@ export class StreamDeduplicator {
       const language = this.extractLanguage(combinedTitle, url);
       const { name: channelName, group: channelGroup } = this.cleanChannelName(
         item.name,
-        item.title
+        item.title,
+        url
       );
       const qualityVariant = this.extractQualityVariant(combinedTitle, url);
       const bitrate = this.extractBitrateBps(combinedTitle);
@@ -572,7 +585,28 @@ export class StreamDeduplicator {
           }
         }
 
-        // 6. Record provenance only if from a distinct secondary provider
+        // 6. Record lossless mirror URLs and provenance if from a secondary provider or distinct CDN mirror URL
+        if (!existing.network.mirrorUrls) {
+          existing.network.mirrorUrls = [
+            {
+              providerKey: existing.provenance.originProvider,
+              providerName: existing.provenance.originProviderName,
+              url: existing.network.masterPlaylistUrl,
+            },
+          ];
+        }
+        if (
+          !existing.network.mirrorUrls.some(
+            (m) => m.providerKey === item.providerKey && m.url === url
+          )
+        ) {
+          existing.network.mirrorUrls.push({
+            providerKey: item.providerKey,
+            providerName: providerDisplayName,
+            url,
+          });
+        }
+
         if (
           item.providerKey !== existing.provenance.originProvider &&
           !existing.provenance.mirroredBy.includes(item.providerKey)
@@ -672,6 +706,13 @@ export class StreamDeduplicator {
           network: {
             masterPlaylistUrl: url,
             ...(directOriginUrl ? { directOriginUrl, isBridgedStream: true } : {}),
+            mirrorUrls: [
+              {
+                providerKey: item.providerKey,
+                providerName: providerDisplayName,
+                url,
+              },
+            ],
             edgeProxyFallbackUrl,
             requiredHeaders: headers,
           },

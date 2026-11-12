@@ -381,19 +381,56 @@ describe("Advanced API Capabilities & Endpoints", () => {
     expect(webHlsBody.streams[0].network.directOriginUrl).toBe(
       "https://cdn.example.com/eng/cenc.mpd"
     );
+
+    // Verify /api/broadcasters/:id detail endpoint
+    const bDetailRes = await app.request(
+      "http://localhost/api/broadcasters/broadcaster_amazon-prime-video"
+    );
+    expect(bDetailRes.status).toBe(200);
+    const bDetailBody = (await bDetailRes.json()) as any;
+    expect(bDetailBody.apiVersion).toBe("1.0.0");
+    expect(bDetailBody.broadcaster.name).toBe("Amazon Prime Video");
+    expect(bDetailBody.fixtures).toHaveLength(1);
+
+    // Verify raw cnc:... ID resolution on /api/fixture/:id
+    const rawLookupRes = await app.request(
+      `http://localhost/api/fixture/${encodeURIComponent(rawId2)}`
+    );
+    expect(rawLookupRes.status).toBe(200);
+    const rawLookupBody = (await rawLookupRes.json()) as any;
+    expect(rawLookupBody.fixture.fixtureId).toBe(fixtureId);
+
+    // Verify catalog broadcaster and language filters
+    const filteredCatRes = await app.request(
+      "http://localhost/api/catalog?broadcaster=Amazon+Prime&language=Hindi"
+    );
+    expect(filteredCatRes.status).toBe(200);
+    const filteredCatBody = (await filteredCatRes.json()) as any;
+    expect(filteredCatBody.fixtures).toHaveLength(1);
   });
 
-  it("blocks SSRF private/loopback targets on /api/proxy", async () => {
-    const ssrfRes = await app.request(
-      "http://localhost/api/proxy?url=" + encodeURIComponent("http://127.0.0.1:8080/admin")
-    );
-    expect(ssrfRes.status).toBe(400);
+  it("blocks SSRF private/loopback/RFC1918/IPv6/metadata targets on /api/proxy", async () => {
+    const blockedUrls = [
+      "http://127.0.0.1:8080/admin",
+      "http://169.254.169.254/latest/meta-data/",
+      "http://10.0.0.1/internal",
+      "http://172.16.0.5/secret",
+      "http://192.168.1.1/router",
+      "http://100.64.0.1/cgnat",
+      "http://[::1]:3000/health",
+      "http://[fd00::1]/ula",
+      "http://metadata.google.internal/computeMetadata/v1/",
+      "http://service.internal/api",
+      "http://user:pass@example.com/stream.m3u8",
+    ];
 
-    const metaSsrfRes = await app.request(
-      "http://localhost/api/proxy?url=" +
-        encodeURIComponent("http://169.254.169.254/latest/meta-data/")
-    );
-    expect(metaSsrfRes.status).toBe(400);
+    for (const target of blockedUrls) {
+      const res = await app.request(
+        "http://localhost/api/proxy?url=" + encodeURIComponent(target)
+      );
+      expect(res.status).toBe(400);
+    }
   });
 });
+
 

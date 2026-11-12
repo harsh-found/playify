@@ -144,6 +144,8 @@ export class EdgeTelemetry {
     if (clean.startsWith("/api/fixtures/")) return "/api/fixtures/:id";
     if (clean.startsWith("/api/competitions/")) return "/api/competitions/:id";
     if (clean.startsWith("/api/tournaments/")) return "/api/tournaments/:id";
+    if (clean.startsWith("/api/broadcasters/")) return "/api/broadcasters/:id";
+    if (clean.startsWith("/api/channels/")) return "/api/channels/:id";
     if (clean.startsWith("/api/teams/")) return "/api/teams/:id";
     if (clean.startsWith("/api/catalog/")) return "/api/catalog/:sport";
     return clean;

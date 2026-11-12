@@ -125,4 +125,29 @@ describe("StreamDeduplicator Unit Tests", () => {
     expect(aSportsStream?.provenance.isMultiSource).toBe(false);
     expect(aSportsStream?.provenance.attributionBadge).toBe("Exclusive to SportzX");
   });
+
+  it("unifies equivalent AIV CDN edge hostnames across providers while preserving all mirrorUrls", () => {
+    const u1 =
+      "http://129.225.106.195/d/master.m3u8?d=https%3A%2F%2Fotte.cache.aiv-cdn.net%2Fiad-nitro%2Flive%2Fclients%2Fdash%2Fenc%2Ff60kqesunw%2Fout%2Fv1%2Fa435ed7a00f947deb4369b46d8f2fb70%2Fcenc.mpd&clearkey=1779c27b9d077a3ba0c9cc1bb9a94b9f%3Acc5ab0ce799d09b73cad4b2ded3b7bbd&maxh=1080";
+    const u2 =
+      "http://129.225.106.195/d/master.m3u8?d=https%3A%2F%2Fotte.live.fly.ww.aiv-cdn.net%2Fiad-nitro%2Flive%2Fclients%2Fdash%2Fenc%2Ff60kqesunw%2Fout%2Fv1%2Fa435ed7a00f947deb4369b46d8f2fb70%2Fcenc.mpd&clearkey=1779c27b9d077a3ba0c9cc1bb9a94b9f%3Acc5ab0ce799d09b73cad4b2ded3b7bbd&maxh=1080";
+
+    expect(StreamDeduplicator.getUrlFingerprint(u1)).toBe(
+      StreamDeduplicator.getUrlFingerprint(u2)
+    );
+
+    const unified = StreamDeduplicator.deduplicate([
+      { url: u1, name: "WILLOW FHD", title: "1080p", providerKey: "sportzx" },
+      { url: u2, name: "Willow Cricket HD", title: "1080p", providerKey: "playfy" },
+    ]);
+
+    expect(unified).toHaveLength(1);
+    expect(unified[0].provenance.isMultiSource).toBe(true);
+    expect(unified[0].network.mirrorUrls).toHaveLength(2);
+    expect(unified[0].network.mirrorUrls?.map((m) => m.providerKey)).toEqual([
+      "sportzx",
+      "playfy",
+    ]);
+  });
 });
+

@@ -4,18 +4,26 @@ import { EdgeCache } from "./core/cache";
 import { EdgeTelemetry } from "./core/telemetry";
 import { Aggregator } from "./providers/aggregator";
 import { StreamProxy } from "./core/proxy";
-import { CatalogQueryOptions } from "./types/catalog.types";
+import { API_VERSION, CatalogQueryOptions } from "./types/catalog.types";
 
 export const app = new Hono();
 
-// 1. Observability Diagnostics, Latency Percentile Tracking & Timing Middleware
+// 1. Observability Diagnostics, Security Headers, Latency Percentile Tracking & Timing Middleware
 app.use("*", async (c, next) => {
   const start = performance.now();
+  const reqId =
+    c.req.header("cf-ray") ||
+    c.req.header("x-request-id") ||
+    `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   await next();
   const elapsed = performance.now() - start;
   EdgeTelemetry.recordRequest(c.req.path, c.res.status, elapsed);
   c.header("X-Response-Time-Ms", Math.round(elapsed).toString());
-  c.header("X-Worker-Version", "2.1.0");
+  c.header("X-Worker-Version", API_VERSION);
+  c.header("X-Request-Id", reqId);
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  c.header("Referrer-Policy", "no-referrer");
 });
 
 // 2. Global CORS Middleware
@@ -71,6 +79,9 @@ function parseCatalogQueryOptions(c: any): {
   const kind = c.req.query("kind");
   const tournament = c.req.query("tournament");
   const provider = c.req.query("provider");
+  const broadcaster = c.req.query("broadcaster") ?? c.req.query("channel");
+  const language = c.req.query("language") ?? c.req.query("lang");
+  const minProvidersRaw = c.req.query("minProviders");
   const hotRaw = c.req.query("hot");
   const date = c.req.query("date");
   const sort = c.req.query("sort") as CatalogQueryOptions["sort"];
@@ -79,6 +90,7 @@ function parseCatalogQueryOptions(c: any): {
   const offsetRaw = c.req.query("offset");
 
   const hot = hotRaw === "true" || hotRaw === "1" ? true : undefined;
+  const minProviders = minProvidersRaw ? parseInt(minProvidersRaw, 10) : undefined;
   const page = pageRaw ? parseInt(pageRaw, 10) : undefined;
   const limit = limitRaw ? parseInt(limitRaw, 10) : undefined;
   const offset = offsetRaw ? parseInt(offsetRaw, 10) : undefined;
@@ -87,6 +99,9 @@ function parseCatalogQueryOptions(c: any): {
     kind ||
       tournament ||
       provider ||
+      broadcaster ||
+      language ||
+      (minProviders !== undefined && !isNaN(minProviders)) ||
       hot !== undefined ||
       date ||
       sort ||
@@ -100,6 +115,9 @@ function parseCatalogQueryOptions(c: any): {
     kind,
     tournament,
     provider,
+    broadcaster,
+    language,
+    minProviders: minProviders !== undefined && !isNaN(minProviders) ? minProviders : undefined,
     hot,
     date,
     sort,
@@ -109,7 +127,7 @@ function parseCatalogQueryOptions(c: any): {
   };
 
   const cacheKeySuffix = hasExtra
-    ? `:${kind ?? ""}:${tournament ?? ""}:${provider ?? ""}:${hot ?? ""}:${date ?? ""}:${sort ?? ""}:${page ?? ""}:${limit ?? ""}:${offset ?? ""}`
+    ? `:${kind ?? ""}:${tournament ?? ""}:${provider ?? ""}:${broadcaster ?? ""}:${language ?? ""}:${minProviders ?? ""}:${hot ?? ""}:${date ?? ""}:${sort ?? ""}:${page ?? ""}:${limit ?? ""}:${offset ?? ""}`
     : "";
 
   return { options, cacheKeySuffix };
@@ -119,7 +137,7 @@ function parseCatalogQueryOptions(c: any): {
 app.get("/", (c) => {
   return c.json({
     service: "Playify Edge Live Sports Gateway",
-    version: "2.1.0",
+    version: API_VERSION,
     architecture: "Edge-Federated Multi-Provider Engine",
     status: "healthy",
     providersIntegrated: Aggregator.CATALOG_DEFINITIONS.length,
@@ -138,6 +156,7 @@ app.get("/", (c) => {
       teams: "/api/teams",
       teamDetail: "/api/teams/:id",
       broadcasters: "/api/broadcasters",
+      broadcasterDetail: "/api/broadcasters/:id",
       channelsAlias: "/api/channels",
       multiEntitySearch: "/api/search?q=<query>",
       fixtureLookup: "/api/fixture/:id",
@@ -147,6 +166,7 @@ app.get("/", (c) => {
       reconciliationAudit: "/api/reconciliation",
       providersHealth: "/api/providers",
       platformStats: "/api/stats",
+      openApiSpec: "/api/openapi.json",
       streamProxy: "/api/proxy?url=<target_m3u8_url>",
       health: "/health",
     },
@@ -378,6 +398,35 @@ const handleBroadcastersRequest = async (c: any) => {
 app.get("/api/broadcasters", handleBroadcastersRequest);
 app.get("/api/channels", handleBroadcastersRequest);
 
+// 14c. Single Broadcaster / Channel Detail API: /api/broadcasters/:id & /api/channels/:id
+const handleBroadcasterDetailRequest = async (c: any) => {
+  const id = c.req.param("id");
+  const decodedId = decodeURIComponent(id);
+  const sport = c.req.query("sport");
+  const phase = c.req.query("phase");
+
+  const detail = await Aggregator.getBroadcasterById(decodedId, sport, phase);
+  if (!detail) {
+    return c.json(
+      {
+        status: "error",
+        error: {
+          code: "BROADCASTER_NOT_FOUND",
+          message: `Broadcaster not found: ${decodedId}`,
+          id: decodedId,
+          timestamp: new Date().toISOString(),
+        },
+      },
+      404
+    );
+  }
+
+  return c.json(detail);
+};
+
+app.get("/api/broadcasters/:id", handleBroadcasterDetailRequest);
+app.get("/api/channels/:id", handleBroadcasterDetailRequest);
+
 // 15. Multi-Entity Search API: /api/search?q=india
 app.get("/api/search", async (c) => {
   const q = c.req.query("q") ?? c.req.query("search") ?? "";
@@ -424,7 +473,7 @@ const handleFixtureLookup = async (c: any) => {
     );
     return c.json({
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       fixture,
       streams: streamData.streams,
       streamSummary: streamData.summary,
@@ -433,7 +482,7 @@ const handleFixtureLookup = async (c: any) => {
 
   return c.json({
     status: "success",
-    apiVersion: "2.1.0",
+    apiVersion: API_VERSION,
     fixture,
   });
 };
@@ -450,6 +499,7 @@ const handleStreamRequest = async (c: any) => {
   const protocol = c.req.query("protocol");
   const provider = c.req.query("provider");
   const channel = c.req.query("channel");
+  const tier = c.req.query("tier") as "primary" | "secondary" | "tertiary" | undefined;
   const playableOn = c.req.query("playableOn") as "web_hls" | "all" | undefined;
   const drmFreeRaw = c.req.query("drmFree");
   const drmFree = drmFreeRaw === "true" || drmFreeRaw === "1" ? true : undefined;
@@ -463,10 +513,11 @@ const handleStreamRequest = async (c: any) => {
     protocol ||
     provider ||
     channel ||
+    tier ||
     playableOn ||
     drmFree !== undefined ||
     !inspectHls
-      ? `:${language ?? ""}:${quality ?? ""}:${protocol ?? ""}:${provider ?? ""}:${channel ?? ""}:${playableOn ?? ""}:${drmFree ?? ""}:${inspectHls}`
+      ? `:${language ?? ""}:${quality ?? ""}:${protocol ?? ""}:${provider ?? ""}:${channel ?? ""}:${tier ?? ""}:${playableOn ?? ""}:${drmFree ?? ""}:${inspectHls}`
       : "";
 
   const cacheKey = `stream:unified:${decodedKey}${filterSuffix}`;
@@ -485,6 +536,7 @@ const handleStreamRequest = async (c: any) => {
           protocol,
           provider,
           channel,
+          tier,
           playableOn,
           drmFree,
           inspectHls,
@@ -535,12 +587,84 @@ const handleDiagnosticsRequest = async (c: any) => {
 app.get("/api/stats", handleDiagnosticsRequest);
 app.get("/api/diagnostics", handleDiagnosticsRequest);
 
-// 21. Stream Header Masquerading & CORS Proxy: /api/proxy?url=...
+// 21. OpenAPI 3.1.0 Specification: /api/openapi.json
+app.get("/api/openapi.json", (c) => {
+  return c.json({
+    openapi: "3.1.0",
+    info: {
+      title: "Playify Edge Live Sports Gateway API",
+      version: API_VERSION,
+      description:
+        "High-performance Cloudflare Edge Worker aggregating 6 live sports providers with continuous cross-provider reconciliation, stream intelligence, DRM & ClearKey extraction, and CORS header proxy.",
+    },
+    paths: {
+      "/": { get: { summary: "Service Discovery & Metadata" } },
+      "/health": { get: { summary: "Edge PoP Health, Cache & Latency Telemetry" } },
+      "/api/sports": { get: { summary: "18 Canonical Sport Facets & Live Match Counts" } },
+      "/api/catalog": {
+        get: {
+          summary: "Unified Multi-Provider Sports Catalog",
+          parameters: [
+            { name: "sport", in: "query", schema: { type: "string" } },
+            { name: "phase", in: "query", schema: { type: "string", enum: ["active", "live", "upcoming", "ended", "all"] } },
+            { name: "search", in: "query", schema: { type: "string" } },
+            { name: "kind", in: "query", schema: { type: "string", enum: ["match", "tournament_channel", "show"] } },
+            { name: "tournament", in: "query", schema: { type: "string" } },
+            { name: "provider", in: "query", schema: { type: "string", enum: ["sportzx", "playztv", "livxow", "sktech", "playfy", "cricify"] } },
+            { name: "broadcaster", in: "query", schema: { type: "string" } },
+            { name: "language", in: "query", schema: { type: "string" } },
+            { name: "minProviders", in: "query", schema: { type: "integer", minimum: 1, maximum: 6 } },
+            { name: "hot", in: "query", schema: { type: "boolean" } },
+            { name: "date", in: "query", schema: { type: "string", format: "date" } },
+            { name: "sort", in: "query", schema: { type: "string", enum: ["default", "time_asc", "time_desc", "popularity", "title_asc", "smart"] } },
+            { name: "page", in: "query", schema: { type: "integer", minimum: 1 } },
+            { name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 500 } },
+            { name: "offset", in: "query", schema: { type: "integer", minimum: 0 } },
+          ],
+        },
+      },
+      "/api/catalog/{sport}": { get: { summary: "Sport-Scoped Unified Catalog" } },
+      "/api/live": { get: { summary: "Live Events Center Grouped by Sport" } },
+      "/api/upcoming": { get: { summary: "Upcoming Schedule Grouped by UTC Date" } },
+      "/api/timeline": { get: { summary: "Chronological EPG Timeline Buckets" } },
+      "/api/competitions": { get: { summary: "Competitions & Tournaments Discovery" } },
+      "/api/competitions/{id}": { get: { summary: "Single Competition Detail & Fixtures" } },
+      "/api/teams": { get: { summary: "Teams & Franchises Discovery" } },
+      "/api/teams/{id}": { get: { summary: "Single Team Detail & Schedule" } },
+      "/api/broadcasters": { get: { summary: "Canonical Broadcast Networks Discovery" } },
+      "/api/broadcasters/{id}": { get: { summary: "Single Broadcaster Detail & Fixtures" } },
+      "/api/search": { get: { summary: "Multi-Entity Search (Fixtures, Teams, Competitions, Broadcasters)" } },
+      "/api/fixture/{id}": { get: { summary: "Direct Fixture Lookup by fixtureId, canonicalKey, or raw cnc ID" } },
+      "/api/stream/{fixtureKey}": {
+        get: {
+          summary: "Unified Multi-Provider Stream Studio & Mirror Groups",
+          parameters: [
+            { name: "language", in: "query", schema: { type: "string" } },
+            { name: "quality", in: "query", schema: { type: "string" } },
+            { name: "protocol", in: "query", schema: { type: "string", enum: ["hls", "dash", "mp4"] } },
+            { name: "provider", in: "query", schema: { type: "string" } },
+            { name: "channel", in: "query", schema: { type: "string" } },
+            { name: "tier", in: "query", schema: { type: "string", enum: ["primary", "secondary", "tertiary"] } },
+            { name: "playableOn", in: "query", schema: { type: "string", enum: ["web_hls", "all"] } },
+            { name: "drmFree", in: "query", schema: { type: "boolean" } },
+            { name: "inspect", in: "query", schema: { type: "boolean" } },
+          ],
+        },
+      },
+      "/api/reconciliation": { get: { summary: "Full Source-to-Output Reconciliation & Zero-Loss Audit" } },
+      "/api/providers": { get: { summary: "Provider Federation Health & Circuit Breaker Telemetry" } },
+      "/api/stats": { get: { summary: "Platform Observability, Cache Metrics & Latency Percentiles" } },
+      "/api/proxy": { get: { summary: "SSRF-Hardened Stream Header Masquerading & M3U8 Rewrite Proxy" } },
+    },
+  });
+});
+
+// 22. Stream Header Masquerading & CORS Proxy: /api/proxy?url=...
 app.get("/api/proxy", async (c) => {
   return StreamProxy.handleProxyRequest(c.req.raw);
 });
 
-// 22. Edge Health Diagnostics
+// 23. Edge Health Diagnostics
 app.get("/health", (c) => {
   const cf = (
     c.req.raw as unknown as {
@@ -558,7 +682,7 @@ app.get("/health", (c) => {
     },
     cache: EdgeCache.getStats(),
     telemetry: EdgeTelemetry.getSnapshot().latency,
-    version: "2.1.0",
+    version: API_VERSION,
     service: "playify-edge",
   });
 });

@@ -80,4 +80,23 @@ describe("ChannelNormalizer Unit Tests", () => {
     expect(res2.name).toBe("Standard Feed");
     expect(res2.group).toBe("General Sports");
   });
+
+  it("uses URL-assisted inference for bare language feeds and prevents bare language channel names", () => {
+    const sonyHindi = ChannelNormalizer.normalize(
+      "SK LIVE",
+      "HINDI 🇮🇳",
+      "https://sonymtmnew-akamaized.pages.dev/master.m3u8?id=311002"
+    );
+    expect(sonyHindi.name).toBe("Sony LIV");
+    expect(sonyHindi.group).toBe("Sony Sports Network");
+
+    const bareLang = ChannelNormalizer.normalize(
+      "Live",
+      "HINDI 🇮🇳",
+      "https://generic-cdn.example.com/live/master.m3u8"
+    );
+    expect(bareLang.name).toBe("Live Broadcast (Hindi)");
+    expect(bareLang.group).toBe("General Sports");
+  });
 });
+

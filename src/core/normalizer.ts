@@ -237,7 +237,7 @@ export class Normalizer {
       label: "Basketball",
       icon: "🏀",
       regex:
-        /\b(nba|wnba|euroleague|basketball|fiba|ncaa\s*basketball|cba|hawks|celtics|nets|hornets|bulls|cavaliers|mavericks|nuggets|pistons|warriors|rockets|pacers|clippers|lakers|grizzlies|heat|bucks|timberwolves|pelicans|knicks|thunder|magic|76ers|sixers|suns|trail\s*blazers|blazers|sacramento\s*kings|kings|spurs|raptors|jazz|wizards)\b/i,
+        /\b(nba|wnba|nbl|euroleague|liga\s*endesa|acb|basketball|fiba|ncaa\s*basketball|cba|perth\s*wildcats|tasmania\s*jackjumpers|melbourne\s*united|sydney\s*kings|adelaide\s*36ers|brisbane\s*bullets|illawarra\s*hawks|cairns\s*taipans|new\s*zealand\s*breakers|hawks|celtics|nets|hornets|bulls|cavaliers|mavericks|nuggets|pistons|warriors|rockets|pacers|clippers|lakers|grizzlies|heat|bucks|timberwolves|pelicans|knicks|thunder|magic|76ers|sixers|suns|trail\s*blazers|blazers|sacramento\s*kings|kings|spurs|raptors|jazz|wizards)\b/i,
     },
     {
       category: "american_football",
@@ -384,20 +384,62 @@ export class Normalizer {
       sportCategory: "tennis",
       regex: /\b(stockholm\s*open|atp\s*250\s*(?:&|vs\.?)\s*(?:wta\s*hong\s*kong|stockholm\s*open))\b/i,
     },
+    {
+      canonicalKey: "combat::aew-dynamite::show",
+      displayName: "AEW Dynamite",
+      sportCategory: "combat",
+      regex: /\b(aew\s*[:|-]?\s*dynamite)\b/i,
+    },
+    {
+      canonicalKey: "combat::aew-collision::show",
+      displayName: "AEW Collision",
+      sportCategory: "combat",
+      regex: /\b(aew\s*[:|-]?\s*collision)\b/i,
+    },
+    {
+      canonicalKey: "football::indian-super-league::tournament",
+      displayName: "Indian Super League (ISL)",
+      sportCategory: "football",
+      regex: /\b(indian\s*super\s*league|\bisl\b)\b/i,
+    },
+    {
+      canonicalKey: "golf::golf-eventos::channel",
+      displayName: "Golf Eventos",
+      sportCategory: "golf",
+      regex: /\b(golf\s*eventos?)\b/i,
+    },
+    {
+      canonicalKey: "tennis::tennis-evento::channel",
+      displayName: "Tennis Evento",
+      sportCategory: "tennis",
+      regex: /\b(tennis\s*eventos?)\b/i,
+    },
   ];
 
   /**
-   * Cleans title strings: repairs UTF-8 mojibake, strips status emojis, leading symbols, and noise.
+   * Cleans title strings: repairs UTF-8 mojibake, strips status emojis, leading symbols, self-referential "X vs X" noise, and extra spaces.
    */
   static cleanTitle(title: string): string {
-    return repairMojibake(title || "")
+    const cleaned = repairMojibake(title || "")
       .replace(/^[🔴🔜✅⚡🍿✨📺🎬]+\s*/gu, "")
       .replace(/\s*[🔴🔜✅⚡🍿✨📺🎬]+\s*$/gu, "")
       .replace(/\b(LIVE|TODAY|UPCOMING)\b/gi, "")
       .replace(/•\s*CNCVerse\s*Bridge/gi, "")
       .replace(/\bFoc\*\*U\s+/gi, "")
+      .replace(/\bThe\s*-\s*Golazo\s+Show\b/gi, "The Golazo Show")
       .replace(/\s+/g, " ")
       .trim();
+
+    // Collapse self-referential "X vs X" titles (e.g. "GOLF EVENTOS vs GOLF EVENTOS" -> "GOLF EVENTOS")
+    const vsParts = cleaned.split(/\s+vs\.?\s+/i);
+    if (
+      vsParts.length === 2 &&
+      vsParts[0].trim().length > 0 &&
+      vsParts[0].trim().toLowerCase() === vsParts[1].trim().toLowerCase()
+    ) {
+      return vsParts[0].trim();
+    }
+    return cleaned;
   }
 
   public static CRICKET_NATIONS = new Set([
@@ -587,7 +629,7 @@ export class Normalizer {
           return { category: "football", label: "Football", icon: "⚽" };
         }
       }
-      if (lower.includes("basket") || lower === "nba") {
+      if (lower.includes("basket") || lower === "nba" || lower === "nbl" || lower === "wnba") {
         return { category: "basketball", label: "Basketball", icon: "🏀" };
       }
       if (
@@ -862,7 +904,7 @@ export class Normalizer {
     const tbCandidate = bestTeams?.teamB || "";
 
     const combinedText = `${name} ${eventInfo?.eventName ?? ""} ${eventInfo?.eventType ?? ""} ${taCandidate} ${tbCandidate}`;
-    const fullSearchText = `${combinedText} ${posterParams.title ?? ""} ${posterParams.teamA ?? ""} ${posterParams.teamB ?? ""}`;
+    const fullSearchText = `${combinedText} ${rawSport || ""} ${posterParams.title ?? ""} ${posterParams.teamA ?? ""} ${posterParams.teamB ?? ""}`;
 
     // 1. Check Tournament / Show Clusters ONLY when this item is NOT a distinct 2-team match
     if (!bestTeams) {
@@ -1054,6 +1096,10 @@ export class Normalizer {
         /\s*(?:\||-)\s*(?:\d+(?:st|nd|rd|th)\s+)?(?:semi-?finals?|quarter-?finals?|finals?|match\s*\d+|game\s*\d+|test|odi|t20i?)\s*$/i,
         ""
       )
+      .replace(
+        /(\b(?:cup|trophy|championship|league|series|open|tournament))\s+(?:\d+(?:st|nd|rd|th)\s+)?(?:grand\s+final|semi-?finals?|quarter-?finals?|finals?)\s*$/i,
+        "$1"
+      )
       .trim();
 
     if (/^nfl\s*\|\s*nfl\s*redzone$/i.test(cleaned) || /^nfl\s*(?:vs\.?\s*)?redzone$/i.test(cleaned)) {
@@ -1064,6 +1110,9 @@ export class Normalizer {
     }
     if (/^womens?\s+emerging\s+nations\s+trophy$/i.test(cleaned)) {
       return "Women's Emerging Nations Trophy";
+    }
+    if (/^ucl\s+womens?$/i.test(cleaned) || /^uefa\s+women'?s\s+champions\s+league$/i.test(cleaned)) {
+      return "UEFA Women's Champions League";
     }
     if (/^women'?s\s+big\s+bash\s+league(?:\s*\(wbbl\))?$/i.test(cleaned) || /^wbbl$/i.test(cleaned)) {
       return "Women's Big Bash League (WBBL)";
@@ -1264,7 +1313,7 @@ export class Normalizer {
     const rawEventNames = candidates
       .map((c) => `${c.name} ${c.eventInfo?.eventName ?? ""} ${c.eventInfo?.eventType ?? ""}`)
       .join(" ");
-    const sampleText = `${rawEventNames} ${tournamentName} ${posterTitle} ${teamAName} ${teamBName}`;
+    const sampleText = `${rawEventNames} ${rawSport} ${tournamentName} ${posterTitle} ${teamAName} ${teamBName}`;
     const sportClassification = this.classifySport(sampleText, rawSport);
 
     if (sportClassification.category === "cricket") {

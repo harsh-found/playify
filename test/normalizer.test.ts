@@ -205,5 +205,42 @@ describe("Normalizer Unit Tests", () => {
       expect(fixture.providerPointers["sportzx"]).toBe("cnc_SportzX_npl");
       expect(fixture.providerPointers["sktech"]).toBe("cnc_SKTech_npl");
     });
+
+    it("collapses self-referential 'X vs X' titles (e.g. GOLF EVENTOS vs GOLF EVENTOS) and classifies NBL as Basketball", () => {
+      expect(Normalizer.cleanTitle("🔴 GOLF EVENTOS vs GOLF EVENTOS")).toBe("GOLF EVENTOS");
+
+      const golfKey1 = Normalizer.computeCanonicalKey(
+        "🔴 Golf Eventos",
+        "Golf",
+        { eventName: "GOLF EVENTOS vs GOLF EVENTOS" },
+        "https://card.cncverse.dpdns.org/?title=GOLF+EVENTOS+vs+GOLF+EVENTOS"
+      );
+      const golfKey2 = Normalizer.computeCanonicalKey(
+        "🔴 Golf Eventos",
+        "Golf",
+        { eventName: "Golf Eventos" }
+      );
+      expect(golfKey1).toBe("golf::golf-eventos::channel");
+      expect(golfKey2).toBe("golf::golf-eventos::channel");
+
+      const nbl = Normalizer.classifySport("Perth Wildcats vs Tasmania Jackjumpers", "NBL");
+      expect(nbl.category).toBe("basketball");
+
+      const uclWomensKey = Normalizer.computeCanonicalKey(
+        "FC Barcelona vs Arsenal",
+        "UCL Womens",
+        {
+          teamA: "Barcelona",
+          teamB: "Arsenal",
+          startTime: "2026-11-12T17:45:00Z",
+        }
+      );
+      expect(uclWomensKey).toBe("football::arsenal::barcelona::w::2026-11-12::s2");
+      expect(Normalizer.normalizeTournamentName("U19 Asia Cup Final")).toBe("U19 Asia Cup");
+      expect(Normalizer.normalizeTournamentName("UCL Womens")).toBe(
+        "UEFA Women's Champions League"
+      );
+    });
   });
 });
+

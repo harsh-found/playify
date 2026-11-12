@@ -1,3 +1,5 @@
+export const API_VERSION = "1.0.0";
+
 export interface TeamEntity {
   id: string;
   name: string;
@@ -99,6 +101,9 @@ export interface CatalogQueryOptions {
   kind?: string;
   tournament?: string;
   provider?: string;
+  broadcaster?: string;
+  language?: string;
+  minProviders?: number;
   hot?: boolean;
   date?: string;
   sort?: "default" | "smart" | "time_asc" | "time_desc" | "popularity" | "title_asc";
@@ -235,6 +240,14 @@ export interface BroadcastersResponse {
   timestamp: string;
   totalBroadcasters: number;
   broadcasters: BroadcasterSummary[];
+}
+
+export interface BroadcasterDetailResponse {
+  status: "success";
+  apiVersion: string;
+  timestamp: string;
+  broadcaster: BroadcasterSummary;
+  fixtures: UnifiedFixture[];
 }
 
 export interface TimelineBucket {

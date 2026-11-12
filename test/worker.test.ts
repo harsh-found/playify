@@ -27,10 +27,12 @@ describe("Arena Edge Worker Integration Test Suite", () => {
       expect(res.status).toBe(200);
       const data = (await res.json()) as any;
       expect(data.status).toBe("healthy");
-      expect(data.version).toBe("2.1.0");
+      expect(data.version).toBe("1.0.0");
       expect(data.endpoints.unifiedCatalog).toBe("/api/catalog");
       expect(data.endpoints.sportsExplore).toBe("/api/sports");
       expect(data.endpoints.unifiedStream).toBe("/api/stream/:fixtureKey");
+      expect(data.endpoints.broadcasterDetail).toBe("/api/broadcasters/:id");
+      expect(data.endpoints.openApiSpec).toBe("/api/openapi.json");
       expect(data.endpoints.streamProxy).toBeDefined();
     });
 
@@ -39,8 +41,18 @@ describe("Arena Edge Worker Integration Test Suite", () => {
       expect(res.status).toBe(200);
       const data = (await res.json()) as any;
       expect(data.status).toBe("ok");
-      expect(data.version).toBe("2.1.0");
+      expect(data.version).toBe("1.0.0");
       expect(data.edge).toBeDefined();
+    });
+
+    it("serves OpenAPI 3.1.0 specification on /api/openapi.json", async () => {
+      const res = await app.request("/api/openapi.json");
+      expect(res.status).toBe(200);
+      const data = (await res.json()) as any;
+      expect(data.openapi).toBe("3.1.0");
+      expect(data.info.version).toBe("1.0.0");
+      expect(data.paths["/api/catalog"]).toBeDefined();
+      expect(data.paths["/api/stream/{fixtureKey}"]).toBeDefined();
     });
 
     it("handles /api/proxy missing parameter validation", async () => {
@@ -70,10 +82,14 @@ describe("Arena Edge Worker Integration Test Suite", () => {
       expect(data.error.code).toBe("NOT_FOUND");
     });
 
-    it("attaches X-Response-Time-Ms and X-Worker-Version headers on every response", async () => {
+    it("attaches X-Response-Time-Ms, X-Worker-Version, X-Request-Id, and security headers on every response", async () => {
       const res = await app.request("/health");
-      expect(res.headers.get("X-Worker-Version")).toBe("2.1.0");
+      expect(res.headers.get("X-Worker-Version")).toBe("1.0.0");
       expect(res.headers.get("X-Response-Time-Ms")).toBeDefined();
+      expect(res.headers.get("X-Request-Id")).toBeDefined();
+      expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+      expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+      expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
     });
   });
 

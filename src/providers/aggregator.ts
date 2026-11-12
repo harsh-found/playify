@@ -1,4 +1,5 @@
 import {
+  API_VERSION,
   CatalogResponse,
   CatalogQueryOptions,
   UnifiedFixture,
@@ -15,6 +16,7 @@ import {
   SearchEntityResult,
   BroadcasterSummary,
   BroadcastersResponse,
+  BroadcasterDetailResponse,
 } from "../types/catalog.types";
 import {
   StreamResponse,
@@ -75,15 +77,21 @@ export class Aggregator {
     soccer: "football",
     epl: "football",
     ucl: "football",
+    laliga: "football",
+    isl: "football",
     mma: "combat",
     ufc: "combat",
     boxing: "combat",
     wwe: "combat",
+    aew: "combat",
     wrestling: "combat",
     f1: "motorsport",
     formula1: "motorsport",
     motogp: "motorsport",
     nba: "basketball",
+    nbl: "basketball",
+    wnba: "basketball",
+    euroleague: "basketball",
     nhl: "hockey",
     ice_hockey: "hockey",
     icehockey: "hockey",
@@ -93,6 +101,16 @@ export class Aggregator {
     pingpong: "table_tennis",
     tabletennis: "table_tennis",
     "table-tennis": "table_tennis",
+    ipl: "cricket",
+    t20: "cricket",
+    odi: "cricket",
+    bbl: "cricket",
+    wbbl: "cricket",
+    psl: "cricket",
+    npl: "cricket",
+    atp: "tennis",
+    wta: "tennis",
+    pga: "golf",
   };
 
   // Bounded in-memory catalog index mapping identifier -> UnifiedFixture with TTL
@@ -808,7 +826,7 @@ export class Aggregator {
       }
       return {
         status: "success",
-        apiVersion: "2.1.0",
+        apiVersion: API_VERSION,
         timestamp: new Date().toISOString(),
         edge: {
           region: "BOM",
@@ -884,6 +902,46 @@ export class Aggregator {
       const dateStr = extraOptions.date.trim();
       filteredFixtures = filteredFixtures.filter((f) =>
         f.schedule.startTimeUtc.startsWith(dateStr)
+      );
+    }
+
+    // 7b. Broadcaster filter
+    if (extraOptions?.broadcaster) {
+      const bFilter = extraOptions.broadcaster.toLowerCase().trim();
+      const bSlug = Normalizer.slugify(bFilter.replace(/^broadcaster_/, ""));
+      filteredFixtures = filteredFixtures.filter((f) =>
+        f.streamMetadata.primaryBroadcasters.some((rawB) => {
+          const norm = ChannelNormalizer.normalize(rawB);
+          return (
+            rawB.toLowerCase().includes(bFilter) ||
+            norm.name.toLowerCase().includes(bFilter) ||
+            norm.group.toLowerCase().includes(bFilter) ||
+            Normalizer.slugify(norm.name) === bSlug
+          );
+        })
+      );
+    }
+
+    // 7c. Language filter
+    if (extraOptions?.language) {
+      const lFilter = extraOptions.language.toLowerCase().trim();
+      filteredFixtures = filteredFixtures.filter((f) =>
+        f.streamMetadata.availableLanguages.some(
+          (lang) =>
+            lang.toLowerCase().includes(lFilter) ||
+            lang.toLowerCase().slice(0, 3) === lFilter
+        )
+      );
+    }
+
+    // 7d. Minimum provider coverage filter
+    if (
+      extraOptions?.minProviders !== undefined &&
+      extraOptions.minProviders > 1
+    ) {
+      const minP = extraOptions.minProviders;
+      filteredFixtures = filteredFixtures.filter(
+        (f) => Object.keys(f.providerPointers).length >= minP
       );
     }
 
@@ -965,7 +1023,7 @@ export class Aggregator {
 
     const response: CatalogResponse = {
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       edge: {
         region: "BOM",
@@ -1030,7 +1088,7 @@ export class Aggregator {
 
     return {
       status: "success" as const,
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       executionTimeMs: Date.now() - startTime,
       totalLiveEvents: catalog.fixtures.length,
@@ -1067,7 +1125,7 @@ export class Aggregator {
 
     return {
       status: "success" as const,
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       executionTimeMs: Date.now() - startTime,
       totalUpcomingEvents: fixtures.length,
@@ -1153,7 +1211,7 @@ export class Aggregator {
 
     return {
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       executionTimeMs: Date.now() - startTime,
       totalActiveEvents: catalog.fixtures.length,
@@ -1245,7 +1303,7 @@ export class Aggregator {
 
     return {
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       totalCompetitions: competitions.length,
       competitions,
@@ -1274,7 +1332,7 @@ export class Aggregator {
 
     return {
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       competition: target,
       fixtures: catalog.fixtures,
@@ -1366,7 +1424,7 @@ export class Aggregator {
 
     return {
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       totalTeams: teams.length,
       teams,
@@ -1403,7 +1461,7 @@ export class Aggregator {
 
     return {
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       team: target,
       fixtures,
@@ -1501,10 +1559,53 @@ export class Aggregator {
 
     return {
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       totalBroadcasters: broadcasters.length,
       broadcasters,
+    };
+  }
+
+  /**
+   * Retrieves a single broadcaster/channel network and all its active/upcoming fixtures by ID, name, or slug.
+   */
+  static async getBroadcasterById(
+    idOrSlug: string,
+    sportFilter?: string,
+    phaseFilter?: string
+  ): Promise<BroadcasterDetailResponse | null> {
+    const clean = decodeURIComponent(idOrSlug).trim().toLowerCase();
+    const slug = Normalizer.slugify(clean.replace(/^broadcaster_/, ""));
+    const normQuery = ChannelNormalizer.normalize(clean);
+    const normSlug = Normalizer.slugify(normQuery.name);
+
+    const allBroadcasters = await this.getBroadcasters(
+      sportFilter,
+      phaseFilter || "all"
+    );
+    const target = allBroadcasters.broadcasters.find(
+      (b) =>
+        b.id.toLowerCase() === clean ||
+        b.id.toLowerCase() === `broadcaster_${slug}` ||
+        Normalizer.slugify(b.name) === slug ||
+        Normalizer.slugify(b.name) === normSlug ||
+        Normalizer.slugify(b.group) === slug
+    );
+    if (!target) return null;
+
+    const catalog = await this.getUnifiedCatalog(
+      sportFilter,
+      phaseFilter || "all",
+      undefined,
+      { broadcaster: target.name }
+    );
+
+    return {
+      status: "success",
+      apiVersion: API_VERSION,
+      timestamp: new Date().toISOString(),
+      broadcaster: target,
+      fixtures: catalog.fixtures,
     };
   }
 
@@ -1519,7 +1620,7 @@ export class Aggregator {
     if (!cleanQuery) {
       return {
         status: "success",
-        apiVersion: "2.1.0",
+        apiVersion: API_VERSION,
         timestamp: new Date().toISOString(),
         query: cleanQuery,
         executionTimeMs: Date.now() - startTime,
@@ -1608,7 +1709,7 @@ export class Aggregator {
 
     return {
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       query: cleanQuery,
       executionTimeMs: Date.now() - startTime,
@@ -1671,7 +1772,7 @@ export class Aggregator {
 
     return {
       status: "success" as const,
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       totalProviders: this.CATALOG_DEFINITIONS.length,
       healthyProviders: providers.filter((p) => p.status === "healthy").length,
@@ -1705,7 +1806,7 @@ export class Aggregator {
 
     return {
       status: "success" as const,
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       timestamp: new Date().toISOString(),
       reconciliation: snapshot?.reconciliation || null,
       cache: cacheStats,
@@ -1945,6 +2046,10 @@ export class Aggregator {
         (s) => s.playbackHints?.webHlsCompatible === true
       );
     }
+    if (filterOptions?.tier) {
+      const tFilter = filterOptions.tier.toLowerCase().trim();
+      finalStreams = finalStreams.filter((s) => s.priorityTier === tFilter);
+    }
 
     const availableLanguages = Array.from(
       new Set(deduplicatedStreams.map((s) => s.language.name))
@@ -1959,7 +2064,7 @@ export class Aggregator {
 
     return {
       status: "success",
-      apiVersion: "2.1.0",
+      apiVersion: API_VERSION,
       fixtureId: identifier,
       canonicalKey,
       generatedAt: new Date().toISOString(),
@@ -1987,7 +2092,7 @@ export class Aggregator {
   }
 
   /**
-   * Retrieves a single fixture by fixtureId or canonicalKey.
+   * Retrieves a single fixture by fixtureId, canonicalKey, or raw upstream cnc:... ID.
    */
   static async getFixtureById(idOrCanonicalKey: string): Promise<UnifiedFixture | null> {
     const cleanKey = idOrCanonicalKey.trim();
@@ -2009,7 +2114,11 @@ export class Aggregator {
           f.fixtureId === cleanKey ||
           f.canonicalKey === cleanKey ||
           f.canonicalKey === `fixture:${cleanKey}` ||
-          f.fixtureId === cleanKey.replace(/^fixture:/, "")
+          f.fixtureId === cleanKey.replace(/^fixture:/, "") ||
+          Object.values(f.providerPointers).includes(cleanKey) ||
+          Object.values(f.providerRawIds || {}).some((rids) =>
+            rids.includes(cleanKey)
+          )
       ) || null
     );
   }

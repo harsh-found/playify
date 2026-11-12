@@ -19,9 +19,9 @@ export class ChannelNormalizer {
     /\b(?:sportzx|playztv|livxow|sktech|playfy|cricify)\s*(?:provider)?\b/gi;
 
   /**
-   * Normalizes raw stream name and title into a polished, canonical broadcast identity.
+   * Normalizes raw stream name, title, and optional playback URL into a polished, canonical broadcast identity.
    */
-  static normalize(rawName?: string, rawTitle?: string): { name: string; group: string } {
+  static normalize(rawName?: string, rawTitle?: string, url?: string): { name: string; group: string } {
     const fullText = (rawTitle || rawName || "").replace(this.EMOJI_REGEX, " ").trim();
 
     // 1. Line-Aware Channel Extraction: In Stremio scrapers (CNCVerse), the channel
@@ -40,7 +40,7 @@ export class ChannelNormalizer {
       } else {
         // Find line containing recognized broadcaster keywords
         const broadcasterLine = lines.find((l) =>
-          /\b(sky|sony|fancode|willow|star|supersport|bein|tnt|dazn|tapmad|ptv|eurosport|astro|tamasha|prime|icc\s*tv|espn|fox|tsn|sportsnet|jio|hotstar|redzone|nba|nhl|nfl|vix|sportv|eleven|spotv|sp0tv|auvio|sbs|apple\s*tv|ten\s*sport)\b/i.test(
+          /\b(sky|sony|fancode|willow|star|supersport|bein|tnt|dazn|tapmad|ptv|eurosport|astro|tamasha|prime|icc\s*tv|espn|fox|kayo|stan|optus|premier\s*sports|viaplay|xtreme|tsn|sportsnet|jio|hotstar|redzone|nba|nhl|nfl|vix|sportv|eleven|spotv|sp0tv|auvio|sbs|apple\s*tv|ten\s*sport)\b/i.test(
             l
           )
         );
@@ -90,7 +90,7 @@ export class ChannelNormalizer {
       upperRaw.startsWith("LOW SERVER") ||
       upperRaw.startsWith("SERVER ")
     ) {
-      return { name: "Standard Feed", group: "General Sports" };
+      return this.inferFromUrl(url) || { name: "Standard Feed", group: "General Sports" };
     }
 
     // 7. Strip technical tokens (e.g. "Direct 396p", "~0.5 Mbps", "1080p", "AQ", "ADFREE")
@@ -113,7 +113,7 @@ export class ChannelNormalizer {
       upper.startsWith("SERVER ") ||
       /^(?:sd\s+server|hd\s+server|low\s+server|low\s+quality|server|live)$/i.test(upper)
     ) {
-      return { name: "Standard Feed", group: "General Sports" };
+      return this.inferFromUrl(url) || { name: "Standard Feed", group: "General Sports" };
     }
 
     // --- Apple TV+ (check before Sky so "Sky via Apple TV" maps to Apple TV+) ---
@@ -340,7 +340,7 @@ export class ChannelNormalizer {
       return { name: "Tennis Channel", group: "Tennis Channel" };
     }
 
-    // --- Global Sports Networks (ViX, SporTV, Eleven, SPOTV, Sport1, RTBF, SBS, Canal+) ---
+    // --- Global Sports Networks (ViX, SporTV, Eleven, SPOTV, Sport1, RTBF, SBS, Canal+, Stan, Optus, Premier Sports, Viaplay, Xtreme+) ---
     if (/\bVIX\b/.test(upper)) {
       return { name: "ViX Deportes", group: "ViX" };
     }
@@ -367,6 +367,21 @@ export class ChannelNormalizer {
     if (/\bCANAL\s*(?:\+|5|SPORT)\b/.test(upper) || upper === "CANAL5") {
       return { name: "Canal+ Sport", group: "Canal+" };
     }
+    if (upper.includes("STAN SPORT")) {
+      return { name: "Stan Sport", group: "Stan Sport" };
+    }
+    if (upper.includes("OPTUS")) {
+      return { name: "Optus Sport", group: "Optus Sport" };
+    }
+    if (upper.includes("PREMIER SPORT")) {
+      return { name: "Premier Sports", group: "Premier Sports" };
+    }
+    if (upper.includes("VIAPLAY")) {
+      return { name: "Viaplay Sports", group: "Viaplay" };
+    }
+    if (upper.includes("XTREME")) {
+      return { name: "Xtreme+ Live", group: "Xtreme+" };
+    }
 
     // --- ESPN / Fox Sports / TSN / Sportsnet ---
     if (upper.includes("ESPN")) {
@@ -386,6 +401,12 @@ export class ChannelNormalizer {
     }
     if (upper.includes("SPORTSNET")) {
       return { name: "Sportsnet HD", group: "Sportsnet" };
+    }
+
+    // Check URL-assisted broadcaster detection when title/name has no recognized broadcaster
+    const urlInferred = this.inferFromUrl(url);
+    if (urlInferred) {
+      return urlInferred;
     }
 
     // Fallback: title-case generic clean name
@@ -411,10 +432,58 @@ export class ChannelNormalizer {
       .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
       .join(" ");
 
+    // Prevent bare language labels (e.g. "Hindi", "English") from masquerading as channel names
+    if (
+      /^(?:Hindi|English|Tamil|Telugu|Kannada|Bengali|Malayalam|Marathi|Gujarati|Punjabi|Urdu|Spanish|Arabic|French|Portuguese|German|Italian|Russian)$/i.test(
+        generic
+      )
+    ) {
+      return {
+        name: `Live Broadcast (${generic})`,
+        group: "General Sports",
+      };
+    }
+
     return {
       name: generic || "Broadcast Channel",
       group: "General Sports",
     };
   }
+
+  /**
+   * Infers canonical broadcaster identity from known CDN / origin URL patterns
+   * when stream metadata contains only generic server or language labels.
+   */
+  private static inferFromUrl(url?: string): { name: string; group: string } | null {
+    if (!url) return null;
+    const lower = url.toLowerCase();
+    if (
+      lower.includes("sonymtmnew") ||
+      lower.includes("slivcdn.com") ||
+      lower.includes("sonyliv")
+    ) {
+      return { name: "Sony LIV", group: "Sony Sports Network" };
+    }
+    if (lower.includes("fancode")) {
+      return { name: "FanCode", group: "FanCode" };
+    }
+    if (lower.includes("tapmad.com")) {
+      return { name: "Tapmad Live", group: "Tapmad" };
+    }
+    if (lower.includes("tamashaweb.com")) {
+      return { name: "Tamasha Live", group: "Tamasha" };
+    }
+    if (lower.includes("msnetworks.net/ptv")) {
+      return { name: "PTV Sports", group: "PTV Sports" };
+    }
+    if (lower.includes("msnetworks.net/a-sports")) {
+      return { name: "A Sports HD", group: "A Sports" };
+    }
+    if (lower.includes("icctv")) {
+      return { name: "ICC.tv", group: "ICC TV" };
+    }
+    return null;
+  }
 }
+
 
