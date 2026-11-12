@@ -176,29 +176,85 @@ export function decodeCncRawId(rawId?: string): CncDecodedPayload {
   return {};
 }
 
+export interface CatalogExclusion {
+  reason: "NON_OBJECT" | "MISSING_ID" | "INVALID_ARRAY";
+  provider: string;
+  details: string;
+}
+
+/**
+ * Runtime validation for upstream catalog items (metas) with explicit exclusion audit tracking.
+ * Never silently discards records: every rejected item is logged with a traceable reason.
+ */
+export function validateUpstreamMetasWithAudit(
+  raw: unknown,
+  providerKey = "unknown"
+): {
+  valid: UpstreamMeta[];
+  exclusions: CatalogExclusion[];
+  totalRaw: number;
+} {
+  if (!Array.isArray(raw)) {
+    return {
+      valid: [],
+      exclusions:
+        raw === undefined || raw === null
+          ? []
+          : [
+              {
+                reason: "INVALID_ARRAY",
+                provider: providerKey,
+                details: `Expected metas array but received ${typeof raw}`,
+              },
+            ],
+      totalRaw: 0,
+    };
+  }
+
+  const valid: UpstreamMeta[] = [];
+  const exclusions: CatalogExclusion[] = [];
+
+  for (let idx = 0; idx < raw.length; idx++) {
+    const item = raw[idx];
+    if (!item || typeof item !== "object") {
+      exclusions.push({
+        reason: "NON_OBJECT",
+        provider: providerKey,
+        details: `Catalog item at index ${idx} is ${item === null ? "null" : typeof item}`,
+      });
+      continue;
+    }
+
+    const rawId = (item as any).id;
+    if (typeof rawId !== "string" || rawId.trim().length === 0) {
+      exclusions.push({
+        reason: "MISSING_ID",
+        provider: providerKey,
+        details: `Catalog item at index ${idx} (name="${String((item as any).name || "")}") has missing or empty string id`,
+      });
+      continue;
+    }
+
+    const meta = item as UpstreamMeta;
+    if (typeof meta.name === "string") {
+      meta.name = repairMojibake(meta.name);
+    }
+    valid.push(meta);
+  }
+
+  return {
+    valid,
+    exclusions,
+    totalRaw: raw.length,
+  };
+}
+
 /**
  * Runtime validation for upstream catalog items (metas).
  * Filters out null, non-objects, and entries without a valid string id, and repairs mojibake in names.
  */
 export function validateUpstreamMetas(raw: unknown): UpstreamMeta[] {
-  if (!Array.isArray(raw)) return [];
-
-  const valid: UpstreamMeta[] = [];
-  for (const item of raw) {
-    if (
-      item &&
-      typeof item === "object" &&
-      typeof (item as any).id === "string" &&
-      (item as any).id.trim().length > 0
-    ) {
-      const meta = item as UpstreamMeta;
-      if (typeof meta.name === "string") {
-        meta.name = repairMojibake(meta.name);
-      }
-      valid.push(meta);
-    }
-  }
-  return valid;
+  return validateUpstreamMetasWithAudit(raw).valid;
 }
 
 /**

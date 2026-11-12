@@ -7,11 +7,13 @@ interface PlaylistCacheEntry {
 
 export class HlsInspector {
   private static playlistCache = new Map<string, PlaylistCacheEntry>();
+  private static inFlightInspections = new Map<string, Promise<StreamRendition[]>>();
   private static MAX_CACHE_ENTRIES = 150;
   private static CACHE_TTL_MS = 60_000;
 
   static clearCache(): void {
     this.playlistCache.clear();
+    this.inFlightInspections.clear();
   }
 
   /**
@@ -132,7 +134,7 @@ export class HlsInspector {
   }
 
   /**
-   * Fetches an M3U8 playlist with a 3.5-second timeout, bounded LRU caching, and extracts renditions.
+   * Fetches an M3U8 playlist with a 3.5-second timeout, single-flight coalescing, bounded LRU caching, and extracts renditions.
    */
   static async inspectStream(
     masterUrl: string,
@@ -140,54 +142,68 @@ export class HlsInspector {
   ): Promise<StreamRendition[]> {
     const cached = this.playlistCache.get(masterUrl);
     if (cached && Date.now() < cached.expiresAt) {
+      // Re-insert for LRU ordering
+      this.playlistCache.delete(masterUrl);
+      this.playlistCache.set(masterUrl, cached);
       return cached.renditions;
     }
 
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const controller = new AbortController();
-      timeout = setTimeout(() => controller.abort(), 3500);
-
-      const resp = await fetch(masterUrl, {
-        signal: controller.signal,
-        headers: headers || {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-          Accept: "*/*",
-        },
-      });
-
-      if (resp.ok) {
-        const text = await resp.text();
-        if (text.includes("#EXTM3U")) {
-          const parsed = this.parseMasterPlaylist(text, masterUrl);
-          if (this.playlistCache.size >= this.MAX_CACHE_ENTRIES) {
-            const oldestKey = this.playlistCache.keys().next().value;
-            if (oldestKey) this.playlistCache.delete(oldestKey);
-          }
-          this.playlistCache.set(masterUrl, {
-            renditions: parsed,
-            expiresAt: Date.now() + this.CACHE_TTL_MS,
-          });
-          return parsed;
-        }
-      }
-    } catch {
-      // Fallback silently to single default rendition
-    } finally {
-      if (timeout) clearTimeout(timeout);
+    const existingPromise = this.inFlightInspections.get(masterUrl);
+    if (existingPromise) {
+      return existingPromise;
     }
 
-    return [
-      {
-        qualityTag: "Auto",
-        label: "Auto (Adaptive)",
-        height: 0,
-        width: 0,
-        bitrate: 0,
-        fps: 0,
-        url: masterUrl,
-        isDefault: true,
-      },
-    ];
+    const promise = (async () => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const controller = new AbortController();
+        timeout = setTimeout(() => controller.abort(), 3500);
+
+        const resp = await fetch(masterUrl, {
+          signal: controller.signal,
+          headers: headers || {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            Accept: "*/*",
+          },
+        });
+
+        if (resp.ok) {
+          const text = await resp.text();
+          if (text.includes("#EXTM3U")) {
+            const parsed = this.parseMasterPlaylist(text, masterUrl);
+            if (this.playlistCache.size >= this.MAX_CACHE_ENTRIES) {
+              const oldestKey = this.playlistCache.keys().next().value;
+              if (oldestKey) this.playlistCache.delete(oldestKey);
+            }
+            this.playlistCache.set(masterUrl, {
+              renditions: parsed,
+              expiresAt: Date.now() + this.CACHE_TTL_MS,
+            });
+            return parsed;
+          }
+        }
+      } catch {
+        // Fallback silently to single default rendition
+      } finally {
+        if (timeout) clearTimeout(timeout);
+        this.inFlightInspections.delete(masterUrl);
+      }
+
+      return [
+        {
+          qualityTag: "Auto",
+          label: "Auto (Adaptive)",
+          height: 0,
+          width: 0,
+          bitrate: 0,
+          fps: 0,
+          url: masterUrl,
+          isDefault: true,
+        },
+      ];
+    })();
+
+    this.inFlightInspections.set(masterUrl, promise);
+    return promise;
   }
 }

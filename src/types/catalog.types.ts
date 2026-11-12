@@ -68,6 +68,8 @@ export interface UnifiedFixture {
   providerPointers: Record<string, string>;
   providerRawIds?: Record<string, string[]>;
   providerCount?: number;
+  mergeConfidence?: number;
+  mergeSignals?: string[];
 }
 
 export interface SportFacet {
@@ -109,6 +111,7 @@ export interface ReconciliationSummary {
   totalProvidersQueried: number;
   healthyProvidersCount: number;
   totalRawItemsExtracted: number;
+  totalExcludedInvalidItems?: number;
   totalUnifiedFixtures: number;
   activeUnifiedFixtures: number;
   endedUnifiedFixtures: number;
@@ -116,6 +119,10 @@ export interface ReconciliationSummary {
   deduplicatedItemsMerged: number;
   reconciledCrossFormatCount: number;
   reconciledNearTimeCount: number;
+  reconciledNoDateCount?: number;
+  reversedHomeAwayResolvedCount?: number;
+  preventedFalseMergesCount?: number;
+  averageMergeConfidence?: number;
   unmappedRawItemsCount: number;
 }
 
@@ -171,6 +178,52 @@ export interface CompetitionDetailResponse {
   timestamp: string;
   competition: CompetitionSummary;
   fixtures: UnifiedFixture[];
+}
+
+export interface TeamSummary {
+  id: string;
+  name: string;
+  code: string;
+  logo: string;
+  sportCategory: string;
+  sportLabel: string;
+  liveMatchesCount: number;
+  upcomingMatchesCount: number;
+  totalFixturesCount: number;
+  competitions: string[];
+  nextMatchTimeUtc?: string;
+}
+
+export interface TeamsResponse {
+  status: "success";
+  apiVersion: string;
+  timestamp: string;
+  totalTeams: number;
+  teams: TeamSummary[];
+}
+
+export interface TeamDetailResponse {
+  status: "success";
+  apiVersion: string;
+  timestamp: string;
+  team: TeamSummary;
+  fixtures: UnifiedFixture[];
+}
+
+export interface TimelineBucket {
+  id: "live_now" | "starting_soon_2h" | "later_today" | "tomorrow" | "upcoming_later";
+  label: string;
+  count: number;
+  fixtures: UnifiedFixture[];
+}
+
+export interface TimelineResponse {
+  status: "success";
+  apiVersion: string;
+  timestamp: string;
+  executionTimeMs: number;
+  totalActiveEvents: number;
+  buckets: TimelineBucket[];
 }
 
 export interface SearchEntityResult {

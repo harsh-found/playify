@@ -4,11 +4,18 @@ import { UpstreamClient } from "../src/providers/upstream-client";
 import { EdgeCache } from "../src/core/cache";
 import { Normalizer } from "../src/core/normalizer";
 import { EventIdentityEngine } from "../src/core/event-identity";
-import { repairMojibake, decodeCncRawId } from "../src/types/upstream.types";
+import { StreamDeduplicator } from "../src/core/deduplicator";
+import { ReconciliationEngine } from "../src/core/reconciliation";
+import {
+  repairMojibake,
+  decodeCncRawId,
+  validateUpstreamMetasWithAudit,
+} from "../src/types/upstream.types";
 
 describe("Automated Reconciliation & Regression Suite", () => {
   beforeEach(() => {
     EdgeCache.clearMemory();
+    UpstreamClient.resetCircuitBreakers();
     vi.restoreAllMocks();
   });
 
@@ -131,7 +138,148 @@ describe("Automated Reconciliation & Regression Suite", () => {
     expect(Normalizer.classifySport("Spain vs France", "UEFA Nations").category).toBe("football");
   });
 
-  it("reconciles cross-provider fixtures when one provider omits match format or differs by 1h across slot boundary, while keeping distinct matches separate", async () => {
+  it("preserves real competition names (One Day International, NFL, Stockholm Open, Copa del Rey) while rejecting them as fake team names", () => {
+    expect(Normalizer.normalizeTournamentName("Copa Del Rey 🇪🇸")).toBe("Copa del Rey");
+    expect(Normalizer.normalizeTournamentName("NFL | NFL REDZONE")).toBe("NFL RedZone");
+    expect(Normalizer.normalizeTournamentName("Womens Emerging Nations Trophy")).toBe(
+      "Women's Emerging Nations Trophy"
+    );
+
+    const odiFixture = Normalizer.cascadeFixture("cricket::india::new-zealand::odi::2026-11-12::s1", [
+      {
+        providerKey: "cricify",
+        rawId: "crc_nz_ind",
+        name: "New Zealand vs India",
+        sport: "Cricket",
+        eventInfo: {
+          teamA: "New Zealand",
+          teamB: "India",
+          eventName: "One Day International",
+          eventCat: "Cricket",
+          startTime: "2026-11-12T08:00:00Z",
+          endTime: "2026-11-12T16:00:00Z",
+        },
+      },
+    ]);
+    expect(odiFixture.tournament.name).toBe("One Day International");
+
+    const nflFixture = Normalizer.cascadeFixture(
+      "american_football::new-york-giants::washington-commanders::2026-11-12::s3",
+      [
+        {
+          providerKey: "sportzx",
+          rawId: "szx_nfl_1",
+          name: "New York Giants vs Washington Commanders",
+          sport: "American Football",
+          eventInfo: {
+            teamA: "New York Giants",
+            teamB: "Washington Commanders",
+            eventName: "NFL",
+            eventCat: "American Football",
+            startTime: "2026-11-12T18:00:00Z",
+            endTime: "2026-11-12T21:30:00Z",
+          },
+        },
+      ]
+    );
+    expect(nflFixture.sportCategory).toBe("american_football");
+    expect(nflFixture.tournament.name).toBe("NFL");
+
+    const tennisShow = Normalizer.cascadeFixture("tennis::stockholm-open::show", [
+      {
+        providerKey: "playztv",
+        rawId: "pzt_atp",
+        name: "ATP",
+        sport: "Tennis",
+        eventInfo: {
+          teamA: "ATP",
+          teamB: "Stockholm Open",
+          eventName: "Stockholm Open",
+          eventCat: "Tennis",
+          startTime: "2026-11-12T12:00:00Z",
+          endTime: "2026-11-12T18:00:00Z",
+        },
+      },
+    ]);
+    expect(tennisShow.kind).not.toBe("match");
+    expect(tennisShow.title).toBe("Stockholm Open");
+  });
+
+  it("audits invalid upstream catalog entries with traceable exclusion reasons and zero silent drops", () => {
+    const nonArrayAudit = validateUpstreamMetasWithAudit({ broken: true }, "sportzx");
+    expect(nonArrayAudit.valid).toHaveLength(0);
+    expect(nonArrayAudit.exclusions).toHaveLength(1);
+    expect(nonArrayAudit.exclusions[0].reason).toBe("INVALID_ARRAY");
+
+    const mixedAudit = validateUpstreamMetasWithAudit(
+      [
+        { id: "cnc:valid_1", name: "Arsenal vs Chelsea", type: "tv" },
+        null,
+        { id: "   ", name: "Missing ID Item" },
+      ],
+      "playztv"
+    );
+    expect(mixedAudit.valid).toHaveLength(1);
+    expect(mixedAudit.exclusions).toHaveLength(2);
+    expect(mixedAudit.exclusions.map((e) => e.reason)).toEqual(["NON_OBJECT", "MISSING_ID"]);
+  });
+
+  it("extracts regional stream languages from bare codes and URL paths, strips ephemeral auth tokens, and sorts HD primary feeds before low-res fallbacks", () => {
+    const rawStreams = [
+      {
+        providerKey: "sportzx",
+        name: "Willow Cricket",
+        title: "Willow HD - 396p (Lowest Quality)",
+        url: "https://cdn.example.com/willow/master.m3u8?maxh=396&hdnea=exp=1700000001~hmac=abc111",
+      },
+      {
+        providerKey: "playztv",
+        name: "Willow Cricket",
+        title: "Willow HD - 396p Mirror",
+        url: "https://cdn.example.com/willow/master.m3u8?maxh=396&hdnea=exp=1700009999~hmac=xyz999",
+      },
+      {
+        providerKey: "cricify",
+        name: "Willow Cricket",
+        title: "Willow Full HD - 1080p",
+        url: "https://cdn.example.com/willow/master.m3u8?maxh=1080&hdnea=exp=1700000001~hmac=def222",
+      },
+      {
+        providerKey: "sportzx",
+        name: "Sony LIV",
+        title: "SONYLIV KAN - AQ",
+        url: "https://dai.google.com/linear/hls/event/cricodi_1211/KAN/master.m3u8",
+      },
+      {
+        providerKey: "livxow",
+        name: "Sony LIV",
+        title: "SONYLIV TEL - AQ",
+        url: "https://dai.google.com/linear/hls/event/cricodi_1211/TEL/master.m3u8",
+      },
+    ];
+
+    const report = StreamDeduplicator.deduplicateWithAudit(rawStreams);
+    expect(report.audit.exclusions).toHaveLength(0);
+    // The two 396p streams with different hdnea tokens collapse into 1 feed with 1 mirror, while 1080p remains distinct
+    expect(report.streams).toHaveLength(4);
+
+    // 1080p primary feed is sorted ahead of the 396p stream even though 396p was first in raw input
+    expect(report.streams[0].qualityVariant).toBe("1080p");
+    expect(report.streams[0].priorityTier).toBe("primary");
+
+    const languages = report.streams.map((s) => s.language.code);
+    expect(languages).toContain("kan");
+    expect(languages).toContain("tel");
+
+    const mirrorGroups = StreamDeduplicator.buildMirrorGroups(report.streams);
+    expect(mirrorGroups.length).toBeGreaterThanOrEqual(3);
+    const willowGroup = mirrorGroups.find((g) => g.channelGroup === "Willow");
+    expect(willowGroup).toBeDefined();
+    expect(willowGroup?.qualities).toContain("1080p");
+    expect(willowGroup?.qualities).toContain("396p");
+  });
+
+  it("reconciles cross-provider fixtures with explainable confidence scores and prevented merge tracking", async () => {
     vi.spyOn(UpstreamClient, "fetchCatalog").mockImplementation(async (catalogId: string) => {
       if (catalogId === "cnc_SportzXLiveEvents_tv") {
         // Provider 1 (SportzX): omits "Test" in eventName, has 05:00Z (slot s0)
@@ -211,8 +359,15 @@ describe("Automated Reconciliation & Regression Suite", () => {
     expect(nov12Fixture).toBeDefined();
     expect(nov12Fixture?.providerCount).toBe(2);
     expect(nov12Fixture?.tournament.name).toBe("ICC World Test Championship");
-    expect(nov12Fixture?.providerRawIds?.sportzx).toHaveLength(1);
-    expect(nov12Fixture?.providerRawIds?.cricify).toHaveLength(1);
+    expect(nov12Fixture?.mergeConfidence).toBeGreaterThanOrEqual(0.8);
+    expect(nov12Fixture?.mergeSignals).toContain("normalized_team_pair");
+
+    const reconReport = await Aggregator.getReconciliationReport();
+    expect(reconReport).not.toBeNull();
+    expect(reconReport?.status).toBe("verified_zero_loss");
+    expect(reconReport?.summary.unmappedRawItemsCount).toBe(0);
+    expect(reconReport?.preventedMerges.length).toBeGreaterThanOrEqual(1);
+    expect(reconReport?.preventedMerges[0].reason).toBe("EXCEEDED_TIME_WINDOW");
   });
 
   it("never merges distinct match numbers (1st T20I vs 2nd T20I) even on the same day", () => {
@@ -229,3 +384,4 @@ describe("Automated Reconciliation & Regression Suite", () => {
     expect(EventIdentityEngine.areCompatible(id1, id2)).toBe(false);
   });
 });
+

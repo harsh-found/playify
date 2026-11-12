@@ -80,11 +80,24 @@ export interface UnifiedStream {
   renditions: StreamRendition[];
 }
 
+export interface ChannelMirrorGroup {
+  channelName: string;
+  channelGroup: string;
+  language: LanguageInfo;
+  recommendedStreamId: string;
+  totalMirrors: number;
+  providers: string[];
+  qualities: string[];
+  hasDrm: boolean;
+  streamIds: string[];
+}
+
 export interface StreamFilterOptions {
   language?: string;
   quality?: string;
   protocol?: string;
   provider?: string;
+  drmFree?: boolean;
   inspectHls?: boolean;
 }
 
@@ -107,6 +120,7 @@ export interface StreamResponse {
     availableLanguages?: string[];
     availableQualities?: string[];
     channelGroups?: string[];
+    mirrorGroups?: ChannelMirrorGroup[];
     audit?: StreamAuditSummary;
   };
   streams: UnifiedStream[];

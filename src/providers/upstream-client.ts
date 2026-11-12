@@ -1,7 +1,8 @@
 import {
   UpstreamMeta,
   UpstreamStream,
-  validateUpstreamMetas,
+  CatalogExclusion,
+  validateUpstreamMetasWithAudit,
   validateUpstreamStreams,
 } from "../types/upstream.types";
 
@@ -16,7 +17,10 @@ export interface ProviderFetchTelemetry {
   catalogId: string;
   lastLatencyMs: number;
   avgLatencyMs: number;
+  lastRawCount?: number;
   lastItemCount: number;
+  lastExcludedCount?: number;
+  lastExclusions?: CatalogExclusion[];
   totalFetches: number;
   totalFailures: number;
   lastSuccessAt?: string;
@@ -38,6 +42,14 @@ export class UpstreamClient {
 
   private static CIRCUIT_BREAKER_THRESHOLD = 3;
   private static CIRCUIT_BREAKER_RESET_MS = 60_000; // 1 minute cooldown
+
+  static resetCircuitBreakers(): void {
+    this.hostStates.clear();
+    this.inFlightRequests.clear();
+    this.providerMetrics.clear();
+    this.totalRequests = 0;
+    this.coalescedHits = 0;
+  }
 
   /**
    * In-flight promise coalescing: deduplicates concurrent requests with the same key.
@@ -253,7 +265,7 @@ export class UpstreamClient {
   }
 
   /**
-   * Fetches an individual catalog across federated upstream hosts with coalescing and telemetry.
+   * Fetches an individual catalog across federated upstream hosts with coalescing, exclusion audit, and telemetry.
    */
   static async fetchCatalog(catalogId: string): Promise<UpstreamMeta[]> {
     const cacheKey = `upstream:catalog:${catalogId}`;
@@ -262,7 +274,10 @@ export class UpstreamClient {
       const path = `/catalog/tv/${catalogId}.json`;
       const data = await this.speculativeFetch(path, 8000, 1800);
       const latency = Date.now() - start;
-      const valid = validateUpstreamMetas(data?.metas);
+      const { valid, exclusions, totalRaw } = validateUpstreamMetasWithAudit(
+        data?.metas,
+        catalogId
+      );
 
       const prev = this.providerMetrics.get(catalogId);
       const totalFetches = (prev?.totalFetches || 0) + 1;
@@ -275,7 +290,10 @@ export class UpstreamClient {
         catalogId,
         lastLatencyMs: latency,
         avgLatencyMs,
+        lastRawCount: totalRaw,
         lastItemCount: valid.length,
+        lastExcludedCount: exclusions.length,
+        lastExclusions: exclusions,
         totalFetches,
         totalFailures,
         lastSuccessAt: data ? new Date().toISOString() : prev?.lastSuccessAt,

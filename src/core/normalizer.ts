@@ -372,6 +372,12 @@ export class Normalizer {
       sportCategory: "motorsport",
       regex: /\b(motogp|moto\s*gp)\b/i,
     },
+    {
+      canonicalKey: "american_football::nfl-redzone::channel",
+      displayName: "NFL RedZone",
+      sportCategory: "american_football",
+      regex: /\b(nfl\s*(?:\||vs\.?)?\s*red\s*zone|red\s*zone)\b/i,
+    },
   ];
 
   /**
@@ -664,8 +670,8 @@ export class Normalizer {
         tA &&
         tB &&
         tA.toLowerCase() !== tB.toLowerCase() &&
-        !this.isGenericTournamentName(tA) &&
-        !this.isGenericTournamentName(tB)
+        !this.isInvalidTeamCandidate(tA) &&
+        !this.isInvalidTeamCandidate(tB)
       ) {
         return { teamA: tA, teamB: tB };
       }
@@ -706,8 +712,8 @@ export class Normalizer {
       ta &&
       tb &&
       ta.toLowerCase() !== tb.toLowerCase() &&
-      !this.isGenericTournamentName(ta) &&
-      !this.isGenericTournamentName(tb)
+      !this.isInvalidTeamCandidate(ta) &&
+      !this.isInvalidTeamCandidate(tb)
     ) {
       return { teamA: ta, teamB: tb };
     }
@@ -811,7 +817,9 @@ export class Normalizer {
     dateString?: string,
     discriminator?: string
   ): string {
-    const s = this.slugify(sportCategory || "sport");
+    const s = /^[a-z0-9_]+$/.test(sportCategory || "")
+      ? sportCategory
+      : this.slugify(sportCategory || "sport");
     const tA = this.slugify(this.normalizeTeamName(teamA));
     const tB = this.slugify(this.normalizeTeamName(teamB));
 
@@ -911,17 +919,19 @@ export class Normalizer {
   }
 
   /**
-   * Checks if a title or team candidate is generic tournament/channel noise rather than a real team or specific tournament.
+   * Checks if a candidate team string is actually a sport, league, show, or placeholder rather than a real team/participant.
    */
-  static isGenericTournamentName(name: string, teamA?: string, teamB?: string): boolean {
+  static isInvalidTeamCandidate(name: string): boolean {
     if (!name) return true;
     const lower = this.cleanTitle(name).toLowerCase().trim();
     if (
       lower === "cricket" ||
       lower === "football" ||
+      lower === "soccer" ||
       lower === "basketball" ||
       lower === "hockey" ||
       lower === "ice hockey" ||
+      lower === "american football" ||
       lower === "tennis" ||
       lower === "boxing" ||
       lower === "mixed martial arts" ||
@@ -945,6 +955,7 @@ export class Normalizer {
       lower === "nfl" ||
       lower === "redzone" ||
       lower === "nfl redzone" ||
+      lower === "atp" ||
       lower === "atp 250" ||
       lower === "wta" ||
       lower === "stockholm open" ||
@@ -964,6 +975,49 @@ export class Normalizer {
     ) {
       return true;
     }
+    return false;
+  }
+
+  /**
+   * Checks if a tournament candidate is merely a generic sport/category label or a raw "Team A vs Team B" string.
+   * Unlike isInvalidTeamCandidate, this ALLOWS real competition names like "One Day International", "NFL", "NBA", "NHL", "Stockholm Open", etc.
+   */
+  static isGenericTournamentName(name: string, teamA?: string, teamB?: string): boolean {
+    if (!name) return true;
+    const lower = this.cleanTitle(name).toLowerCase().trim();
+    if (
+      lower === "cricket" ||
+      lower === "football" ||
+      lower === "soccer" ||
+      lower === "basketball" ||
+      lower === "hockey" ||
+      lower === "ice hockey" ||
+      lower === "american football" ||
+      lower === "tennis" ||
+      lower === "boxing" ||
+      lower === "mixed martial arts" ||
+      lower === "mma" ||
+      lower === "motorsport" ||
+      lower === "golf" ||
+      lower === "rugby" ||
+      lower === "volleyball" ||
+      lower === "table tennis" ||
+      lower === "badminton" ||
+      lower === "kabaddi" ||
+      lower === "darts" ||
+      lower === "snooker" ||
+      lower === "cycling" ||
+      lower === "athletics" ||
+      lower === "live events" ||
+      lower === "live sports" ||
+      lower === "team a" ||
+      lower === "team b" ||
+      lower === "others" ||
+      lower === "other" ||
+      lower === "tv"
+    ) {
+      return true;
+    }
     // Any string of the form "Team X vs Team Y" without a tournament prefix (like "UFC 334:") is a match title, not a tournament name!
     if (/\s+vs\.?\s+/i.test(lower) && !lower.includes(":")) {
       return true;
@@ -973,6 +1027,46 @@ export class Normalizer {
       if (lower === matchPattern) return true;
     }
     return false;
+  }
+
+  /**
+   * Normalizes tournament/competition names: strips country flag emojis, redundant sport prefixes, and unifies common synonyms.
+   */
+  static normalizeTournamentName(raw: string): string {
+    if (!raw) return "";
+    let cleaned = repairMojibake(raw)
+      .replace(
+        /[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{1F900}-\u{1F9FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{200D}\u{FE0F}]/gu,
+        ""
+      )
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (/^nfl\s*\|\s*nfl\s*redzone$/i.test(cleaned) || /^nfl\s*(?:vs\.?\s*)?redzone$/i.test(cleaned)) {
+      return "NFL RedZone";
+    }
+    if (/^copa\s+del\s+rey$/i.test(cleaned)) {
+      return "Copa del Rey";
+    }
+    if (/^womens?\s+emerging\s+nations\s+trophy$/i.test(cleaned)) {
+      return "Women's Emerging Nations Trophy";
+    }
+    if (/^uefa\s+nations$/i.test(cleaned)) {
+      return "UEFA Nations League";
+    }
+    if (/^fifa\s+friendlies$/i.test(cleaned)) {
+      return "International Friendly Games";
+    }
+    if (/^afcon$/i.test(cleaned)) {
+      return "Africa Cup of Nations Qual.";
+    }
+    if (/^test\s+championship$/i.test(cleaned)) {
+      return "ICC World Test Championship";
+    }
+    if (/^stockholm\s+open$/i.test(cleaned)) {
+      return "Stockholm Open";
+    }
+    return cleaned;
   }
 
   /**
@@ -1109,10 +1203,10 @@ export class Normalizer {
         c.sport,
       ]
         .filter((val): val is string => typeof val === "string" && val.trim().length > 0)
-        .map((val) => repairMojibake(val.trim()));
+        .map((val) => this.normalizeTournamentName(val));
 
       for (const tCand of tournamentCandidates) {
-        if (!this.isGenericTournamentName(tCand, teamAName, teamBName)) {
+        if (tCand && !this.isGenericTournamentName(tCand, teamAName, teamBName)) {
           if (!tournamentName || tCand.length > tournamentName.length) {
             tournamentName = tCand;
           }
@@ -1147,8 +1241,8 @@ export class Normalizer {
       teamAName &&
       teamBName &&
       teamAName.toLowerCase() !== teamBName.toLowerCase() &&
-      !this.isGenericTournamentName(teamAName) &&
-      !this.isGenericTournamentName(teamBName) &&
+      !this.isInvalidTeamCandidate(teamAName) &&
+      !this.isInvalidTeamCandidate(teamBName) &&
       !canonicalKey.endsWith("::tournament") &&
       !canonicalKey.endsWith("::show") &&
       !canonicalKey.endsWith("::channel")
@@ -1186,11 +1280,18 @@ export class Normalizer {
     } else {
       // It's a tournament channel or show: NO "Team A vs Team B"!
       const candidateCleanName = this.cleanTitle(candidates[0]?.name || "");
+      const hasFakeVs = /\s+vs\.?\s+/i.test(candidateCleanName);
       if (cluster) {
         title = cluster.displayName;
-      } else if (posterTitle) {
+      } else if (posterTitle && !/\s+vs\.?\s+/i.test(posterTitle)) {
         title = posterTitle;
-      } else if (candidateCleanName && candidateCleanName.length >= 3) {
+      } else if (
+        tournamentName &&
+        !this.isGenericTournamentName(tournamentName) &&
+        (hasFakeVs || candidateCleanName.length <= 4)
+      ) {
+        title = tournamentName;
+      } else if (candidateCleanName && candidateCleanName.length >= 3 && !hasFakeVs) {
         title = candidateCleanName;
       } else if (tournamentName && !this.isGenericTournamentName(tournamentName)) {
         title = tournamentName;

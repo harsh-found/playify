@@ -7,6 +7,11 @@ import {
   CompetitionSummary,
   CompetitionsResponse,
   CompetitionDetailResponse,
+  TeamSummary,
+  TeamsResponse,
+  TeamDetailResponse,
+  TimelineBucket,
+  TimelineResponse,
   SearchEntityResult,
 } from "../types/catalog.types";
 import { StreamResponse, StreamFilterOptions, UnifiedStream } from "../types/stream.types";
@@ -18,6 +23,15 @@ import { StreamDeduplicator } from "../core/deduplicator";
 import { HlsInspector } from "../core/hls-inspector";
 import { DrmDetector } from "../core/drm";
 import { EdgeCache } from "../core/cache";
+import { EdgeTelemetry } from "../core/telemetry";
+import {
+  ReconciliationEngine,
+  MergeResolutionType,
+  MergeDecisionRecord,
+  PreventedMergeRecord,
+  ProviderExtractionAccounting,
+  FullReconciliationReport,
+} from "../core/reconciliation";
 
 interface FixtureIndexEntry {
   fixture: UnifiedFixture;
@@ -28,11 +42,14 @@ interface BaseCatalogSnapshot {
   generation: number;
   createdAt: number;
   allFixtures: UnifiedFixture[];
+  bySportMap: Map<string, UnifiedFixture[]>;
+  searchHaystacks: Map<string, string>;
   sportFacets: SportFacet[];
   globalTotalLive: number;
   globalTotalUpcoming: number;
   globalTotalEnded: number;
   reconciliation: ReconciliationSummary;
+  fullReconciliationReport: FullReconciliationReport;
   providerItemCounts: Record<string, number>;
 }
 
@@ -64,8 +81,10 @@ export class Aggregator {
     icehockey: "hockey",
     nfl: "american_football",
     americanfootball: "american_football",
+    "american-football": "american_football",
     pingpong: "table_tennis",
     tabletennis: "table_tennis",
+    "table-tennis": "table_tennis",
   };
 
   // Bounded in-memory catalog index mapping identifier -> UnifiedFixture with TTL
@@ -116,6 +135,29 @@ export class Aggregator {
     const clean = sport.trim().toLowerCase();
     if (!clean || clean === "all") return "all";
     return this.SPORT_FILTER_ALIASES[clean] || clean;
+  }
+
+  /**
+   * Pre-computes a normalized lowercased search haystack for O(1) per-fixture token matching.
+   */
+  private static buildSearchHaystack(f: UnifiedFixture): string {
+    const parts = [
+      f.title,
+      f.teams?.home?.name || "",
+      f.teams?.away?.name || "",
+      f.teams?.home?.code || "",
+      f.teams?.away?.code || "",
+      f.tournament?.name || "",
+      f.tournament?.shortName || "",
+      f.sportCategory,
+      f.sport,
+      f.eventDetails?.format || "",
+      f.eventDetails?.stage || "",
+      f.eventDetails?.ageGroup || "",
+      f.eventDetails?.gender || "",
+      ...(f.streamMetadata?.primaryBroadcasters || []),
+    ];
+    return parts.join(" ").toLowerCase();
   }
 
   /**
@@ -182,7 +224,29 @@ export class Aggregator {
   }
 
   /**
-   * Builds (or coalesces) the normalized base catalog across all 6 upstream providers.
+   * Detects whether candidates in a cluster had reversed Home/Away team ordering across providers.
+   */
+  private static detectHomeAwayReversal(candidates: any[]): boolean {
+    if (candidates.length < 2) return false;
+    let firstHomeSlug = "";
+    for (const c of candidates) {
+      const posterParams = Normalizer.extractParamsFromPosterUrl(c.poster);
+      const pair = Normalizer.extractBestTeams(c.name, c.eventInfo, posterParams);
+      if (pair) {
+        const homeSlug = Normalizer.slugify(pair.teamA);
+        if (!firstHomeSlug) {
+          firstHomeSlug = homeSlug;
+        } else if (homeSlug !== firstHomeSlug) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Builds (or coalesces) the normalized base catalog across all 6 upstream providers
+   * with full source-to-output reconciliation accounting and pre-computed secondary indexes.
    */
   private static async buildOrGetBaseCatalog(): Promise<BaseCatalogSnapshot | null> {
     const currentGen = EdgeCache.getGeneration();
@@ -208,17 +272,30 @@ export class Aggregator {
           })
         );
 
+        const upstreamDiag = UpstreamClient.getDiagnostics();
         const groupedCandidates = new Map<string, any[]>();
+        const clusterMergeTypes = new Map<string, Set<MergeResolutionType>>();
         const providerItemCounts: Record<string, number> = {};
+        const providerRawItemIds = new Map<string, string[]>();
         let healthyProvidersCount = 0;
         let totalRawItemsExtracted = 0;
+        let totalExcludedInvalidItems = 0;
+        let totalRawPayloadItems = 0;
 
         for (const res of results) {
           if (res.status !== "fulfilled") continue;
           const { def, items } = res.value;
           providerItemCounts[def.key] = items.length;
+          providerRawItemIds.set(
+            def.key,
+            items.map((i) => i.id)
+          );
           if (items.length > 0) healthyProvidersCount += 1;
           totalRawItemsExtracted += items.length;
+
+          const pMetric = upstreamDiag.providerMetrics[def.id];
+          totalExcludedInvalidItems += pMetric?.lastExcludedCount || 0;
+          totalRawPayloadItems += pMetric?.lastRawCount ?? items.length;
 
           for (const item of items) {
             const rawId = item.id || "";
@@ -249,10 +326,17 @@ export class Aggregator {
             const existing = groupedCandidates.get(canonicalKey) || [];
             existing.push(candidateEntry);
             groupedCandidates.set(canonicalKey, existing);
+            if (!clusterMergeTypes.has(canonicalKey)) {
+              clusterMergeTypes.set(
+                canonicalKey,
+                new Set<MergeResolutionType>(["exact_canonical_key"])
+              );
+            }
           }
         }
 
         // Pass 1: Reconcile 'nodate' keys into an existing dated key for the same match
+        let reconciledNoDateCount = 0;
         for (const [key, candidates] of Array.from(groupedCandidates.entries())) {
           if (key.endsWith("::nodate")) {
             const prefix = key.slice(0, -8);
@@ -264,6 +348,8 @@ export class Aggregator {
               ) {
                 otherCandidates.push(...candidates);
                 groupedCandidates.delete(key);
+                clusterMergeTypes.get(otherKey)?.add("nodate_reconciliation");
+                reconciledNoDateCount += 1;
                 break;
               }
             }
@@ -271,11 +357,9 @@ export class Aggregator {
         }
 
         // Pass 2: Multi-Signal Match Reconciliation across providers
-        // Reconciles matches with the exact same teamPair within a 4-hour start window
-        // when one provider omitted format/gender tags (e.g. SportzX "PAK vs SL" vs PlayZTV "Pakistan vs Sri Lanka" Test)
-        // or when start times cross a 6-hour session boundary (e.g. 05:00Z s0 vs 06:00Z s1) or UTC midnight.
         let reconciledCrossFormatCount = 0;
         let reconciledNearTimeCount = 0;
+        const preventedMerges: PreventedMergeRecord[] = [];
 
         const matchEntries = Array.from(groupedCandidates.entries())
           .map(([key, candidates]) => ({
@@ -283,7 +367,15 @@ export class Aggregator {
             candidates,
             parsed: this.parseMatchKeyParts(key, candidates),
           }))
-          .filter((e): e is { key: string; candidates: any[]; parsed: NonNullable<ReturnType<typeof Aggregator.parseMatchKeyParts>> } => e.parsed !== null);
+          .filter(
+            (
+              e
+            ): e is {
+              key: string;
+              candidates: any[];
+              parsed: NonNullable<ReturnType<typeof Aggregator.parseMatchKeyParts>>;
+            } => e.parsed !== null
+          );
 
         // Sort so richer keys (more discriminators, more candidates) come first as merge targets
         matchEntries.sort(
@@ -305,7 +397,6 @@ export class Aggregator {
             // Must be the exact same normalized team pair
             if (target.parsed.teamPair !== source.parsed.teamPair) continue;
 
-            // Sport must match (or one is generic fallback "football" while the other is specific "cricket" within 1h)
             const sameSport = target.parsed.sport === source.parsed.sport;
             const timeDiffMs =
               !isNaN(target.parsed.startTimeMs) && !isNaN(source.parsed.startTimeMs)
@@ -314,8 +405,44 @@ export class Aggregator {
                 ? 0
                 : Infinity;
 
+            // Check EventIdentity compatibility first so we can log prevented false merges on same-team fixtures
+            const idA = target.parsed.identity;
+            const idB = source.parsed.identity;
+            if (!EventIdentityEngine.areCompatible(idA, idB)) {
+              let reason: PreventedMergeRecord["reason"] = "CONFLICTING_FORMAT";
+              if (idA.matchNumber && idB.matchNumber && idA.matchNumber !== idB.matchNumber) {
+                reason = "CONFLICTING_MATCH_NUMBER";
+              } else if (idA.stage && idB.stage && idA.stage !== idB.stage) {
+                reason = "CONFLICTING_STAGE";
+              } else if (
+                (idA.ageGroup && idB.ageGroup && idA.ageGroup !== idB.ageGroup) ||
+                Boolean(idA.ageGroup) !== Boolean(idB.ageGroup)
+              ) {
+                reason = "CONFLICTING_AGE_GROUP";
+              } else if (idA.gender && idB.gender && idA.gender !== idB.gender) {
+                reason = "CONFLICTING_GENDER";
+              }
+              preventedMerges.push({
+                keyA: target.key,
+                keyB: source.key,
+                teamPair: target.parsed.teamPair,
+                reason,
+                details: `Kept separate due to incompatible event identity (${idA.canonicalDiscriminator || "base"} vs ${idB.canonicalDiscriminator || "base"})`,
+              });
+              continue;
+            }
+
             // Must be within 4 hours of each other
-            if (timeDiffMs > 4 * 3600 * 1000) continue;
+            if (timeDiffMs > 4 * 3600 * 1000) {
+              preventedMerges.push({
+                keyA: target.key,
+                keyB: source.key,
+                teamPair: target.parsed.teamPair,
+                reason: "EXCEEDED_TIME_WINDOW",
+                details: `Start times differ by ${Math.round(timeDiffMs / 3600_000)}h (> 4h threshold)`,
+              });
+              continue;
+            }
 
             if (!sameSport) {
               // Only allow cross-sport reconciliation if within 1 hour and one was fallback football
@@ -323,12 +450,16 @@ export class Aggregator {
                 timeDiffMs <= 3600 * 1000 &&
                 ((target.parsed.sport === "cricket" && source.parsed.sport === "football") ||
                   (target.parsed.sport === "football" && source.parsed.sport === "cricket"));
-              if (!isCricketVsFallback) continue;
-            }
-
-            // Check EventIdentity compatibility (never merge Test with T20, or 1st Test with 2nd Test, or U19 with Senior)
-            if (!EventIdentityEngine.areCompatible(target.parsed.identity, source.parsed.identity)) {
-              continue;
+              if (!isCricketVsFallback) {
+                preventedMerges.push({
+                  keyA: target.key,
+                  keyB: source.key,
+                  teamPair: target.parsed.teamPair,
+                  reason: "INCOMPATIBLE_SPORT",
+                  details: `Same team names across distinct sports (${target.parsed.sport} vs ${source.parsed.sport})`,
+                });
+                continue;
+              }
             }
 
             // Merge source into target
@@ -338,17 +469,53 @@ export class Aggregator {
 
             if (target.parsed.discParts.join("::") !== source.parsed.discParts.join("::")) {
               reconciledCrossFormatCount += 1;
+              clusterMergeTypes.get(target.key)?.add("cross_format_reconciliation");
             } else {
               reconciledNearTimeCount += 1;
+              clusterMergeTypes.get(target.key)?.add("near_time_reconciliation");
             }
           }
         }
 
-        // Cascade each grouped cluster into a UnifiedFixture
+        // Cascade each grouped cluster into a UnifiedFixture and evaluate merge confidence
         const unifiedFixturesMap = new Map<string, UnifiedFixture>();
+        const mergeDecisions: MergeDecisionRecord[] = [];
+        let reversedHomeAwayResolvedCount = 0;
+        let confidenceSum = 0;
 
         for (const [canonicalKey, candidates] of groupedCandidates.entries()) {
           const fixture = Normalizer.cascadeFixture(canonicalKey, candidates);
+          const reversed = this.detectHomeAwayReversal(candidates);
+          if (reversed) reversedHomeAwayResolvedCount += 1;
+
+          const mTypes =
+            clusterMergeTypes.get(canonicalKey) ||
+            new Set<MergeResolutionType>(["exact_canonical_key"]);
+          const evaluation = ReconciliationEngine.evaluateClusterConfidence(
+            fixture,
+            candidates,
+            mTypes,
+            reversed
+          );
+
+          fixture.mergeConfidence = evaluation.confidenceScore;
+          fixture.mergeSignals = evaluation.signalsMatched;
+          confidenceSum += evaluation.confidenceScore;
+
+          if (candidates.length > 1) {
+            mergeDecisions.push({
+              canonicalKey: fixture.canonicalKey,
+              fixtureId: fixture.fixtureId,
+              title: fixture.title,
+              sportCategory: fixture.sportCategory,
+              mergeType: evaluation.mergeType,
+              confidenceScore: evaluation.confidenceScore,
+              providers: Object.keys(fixture.providerPointers),
+              rawItemCount: candidates.length,
+              reversedHomeAwayDetected: reversed,
+              signalsMatched: evaluation.signalsMatched,
+            });
+          }
 
           const existing = unifiedFixturesMap.get(fixture.canonicalKey);
           if (existing) {
@@ -388,6 +555,8 @@ export class Aggregator {
           string,
           { total: number; live: number; upcoming: number; ended: number }
         >();
+        const bySportMap = new Map<string, UnifiedFixture[]>();
+        const searchHaystacks = new Map<string, string>();
         let globalTotalLive = 0;
         let globalTotalUpcoming = 0;
         let globalTotalEnded = 0;
@@ -395,6 +564,13 @@ export class Aggregator {
         const mappedRawIdsSet = new Set<string>();
 
         for (const fixture of allFixtures) {
+          // Pre-compute search haystack & sport index
+          searchHaystacks.set(fixture.fixtureId, this.buildSearchHaystack(fixture));
+          const spKey = fixture.sportCategory.toLowerCase();
+          const spList = bySportMap.get(spKey) || [];
+          spList.push(fixture);
+          bySportMap.set(spKey, spList);
+
           if (Object.keys(fixture.providerPointers).length > 1) {
             multiProviderFixturesCount += 1;
           }
@@ -482,15 +658,39 @@ export class Aggregator {
           };
         });
 
-        const unmappedRawItemsCount = Math.max(
-          0,
-          totalRawItemsExtracted - mappedRawIdsSet.size
+        // Build per-provider extraction accounting
+        const providerAccounting: ProviderExtractionAccounting[] = this.CATALOG_DEFINITIONS.map(
+          (def) => {
+            const pMetric = upstreamDiag.providerMetrics[def.id];
+            const rawIds = providerRawItemIds.get(def.key) || [];
+            const unmappedIds = rawIds.filter((id) => !mappedRawIdsSet.has(id));
+            return {
+              providerKey: def.key,
+              providerName: def.name,
+              rawPayloadCount: pMetric?.lastRawCount ?? rawIds.length,
+              validItemsCount: rawIds.length,
+              excludedItemsCount: pMetric?.lastExcludedCount || 0,
+              mappedToFixturesCount: rawIds.length - unmappedIds.length,
+              unmappedIds,
+              exclusions: pMetric?.lastExclusions || [],
+            };
+          }
         );
+
+        const unmappedRawItemsCount = providerAccounting.reduce(
+          (acc, p) => acc + p.unmappedIds.length,
+          0
+        );
+        const averageMergeConfidence =
+          allFixtures.length > 0
+            ? Number((confidenceSum / allFixtures.length).toFixed(2))
+            : 1;
 
         const reconciliation: ReconciliationSummary = {
           totalProvidersQueried: this.CATALOG_DEFINITIONS.length,
           healthyProvidersCount,
           totalRawItemsExtracted,
+          totalExcludedInvalidItems,
           totalUnifiedFixtures: allFixtures.length,
           activeUnifiedFixtures: totalActiveCount,
           endedUnifiedFixtures: globalTotalEnded,
@@ -498,18 +698,55 @@ export class Aggregator {
           deduplicatedItemsMerged: Math.max(0, totalRawItemsExtracted - allFixtures.length),
           reconciledCrossFormatCount,
           reconciledNearTimeCount,
+          reconciledNoDateCount,
+          reversedHomeAwayResolvedCount,
+          preventedFalseMergesCount: preventedMerges.length,
+          averageMergeConfidence,
           unmappedRawItemsCount,
+        };
+
+        const fullReconciliationReport: FullReconciliationReport = {
+          status:
+            unmappedRawItemsCount === 0
+              ? "verified_zero_loss"
+              : "degraded_partial_loss",
+          generatedAt: new Date().toISOString(),
+          summary: {
+            totalProvidersQueried: this.CATALOG_DEFINITIONS.length,
+            healthyProvidersCount,
+            totalRawPayloadItems,
+            totalValidItemsExtracted: totalRawItemsExtracted,
+            totalExcludedInvalidItems,
+            totalUnifiedFixtures: allFixtures.length,
+            activeUnifiedFixtures: totalActiveCount,
+            endedUnifiedFixtures: globalTotalEnded,
+            multiProviderFixturesCount,
+            deduplicatedItemsMerged: Math.max(0, totalRawItemsExtracted - allFixtures.length),
+            reconciledCrossFormatCount,
+            reconciledNearTimeCount,
+            reconciledNoDateCount,
+            reversedHomeAwayResolvedCount,
+            preventedFalseMergesCount: preventedMerges.length,
+            unmappedRawItemsCount,
+            averageMergeConfidence,
+          },
+          providerAccounting,
+          mergeDecisions,
+          preventedMerges,
         };
 
         const snapshot: BaseCatalogSnapshot = {
           generation: currentGen,
           createdAt: Date.now(),
           allFixtures,
+          bySportMap,
+          searchHaystacks,
           sportFacets,
           globalTotalLive,
           globalTotalUpcoming,
           globalTotalEnded,
           reconciliation,
+          fullReconciliationReport,
           providerItemCounts,
         };
 
@@ -576,13 +813,12 @@ export class Aggregator {
     const resolvedPhase = (phaseFilter ?? extraOptions?.phase)?.trim().toLowerCase();
     const resolvedSearch = searchQuery ?? extraOptions?.search;
 
-    let filteredFixtures = [...snapshot.allFixtures];
-
-    // 1. Sport filter
+    // 1. O(1) Sport index lookup when sport filter is specified
+    let filteredFixtures: UnifiedFixture[];
     if (resolvedSport && resolvedSport !== "all") {
-      filteredFixtures = filteredFixtures.filter(
-        (f) => f.sportCategory.toLowerCase() === resolvedSport
-      );
+      filteredFixtures = [...(snapshot.bySportMap.get(resolvedSport) || [])];
+    } else {
+      filteredFixtures = [...snapshot.allFixtures];
     }
 
     // 2. Phase filter (default: active matches only = live + upcoming)
@@ -631,7 +867,7 @@ export class Aggregator {
       );
     }
 
-    // 8. Full-text tokenized search across teams, codes, titles, leagues, sports, stage, format, and broadcasters
+    // 8. Pre-indexed tokenized search across teams, codes, titles, leagues, sports, stage, format, and broadcasters
     if (resolvedSearch && resolvedSearch.trim().length > 0) {
       const tokens = resolvedSearch
         .toLowerCase()
@@ -640,35 +876,9 @@ export class Aggregator {
         .filter(Boolean);
 
       filteredFixtures = filteredFixtures.filter((f) => {
-        const homeName = (f.teams?.home?.name || "").toLowerCase();
-        const awayName = (f.teams?.away?.name || "").toLowerCase();
-        const homeCode = (f.teams?.home?.code || "").toLowerCase();
-        const awayCode = (f.teams?.away?.code || "").toLowerCase();
-        const title = (f.title || "").toLowerCase();
-        const tournamentName = (f.tournament?.name || "").toLowerCase();
-        const sportCat = (f.sportCategory || "").toLowerCase();
-        const sportLabel = (f.sport || "").toLowerCase();
-        const format = (f.eventDetails?.format || "").toLowerCase();
-        const stage = (f.eventDetails?.stage || "").toLowerCase();
-        const broadcasters = (f.streamMetadata?.primaryBroadcasters || []).map((b) =>
-          b.toLowerCase()
-        );
-
-        return tokens.every((token) => {
-          return (
-            title.includes(token) ||
-            homeName.includes(token) ||
-            awayName.includes(token) ||
-            homeCode === token ||
-            awayCode === token ||
-            tournamentName.includes(token) ||
-            sportCat.includes(token) ||
-            sportLabel.includes(token) ||
-            format === token ||
-            stage.includes(token) ||
-            broadcasters.some((b) => b.includes(token))
-          );
-        });
+        const haystack =
+          snapshot.searchHaystacks.get(f.fixtureId) || this.buildSearchHaystack(f);
+        return tokens.every((token) => haystack.includes(token));
       });
     }
 
@@ -687,7 +897,7 @@ export class Aggregator {
           new Date(a.schedule.startTimeUtc).getTime()
         );
       }
-      if (sortMode === "popularity") {
+      if (sortMode === "popularity" || sortMode === "smart") {
         if (a.phase === "live" && b.phase !== "live") return -1;
         if (a.phase !== "live" && b.phase === "live") return 1;
         const pDiff =
@@ -713,10 +923,7 @@ export class Aggregator {
     // 10. Optional Pagination
     const totalItems = filteredFixtures.length;
     let pagination: CatalogResponse["pagination"] | undefined;
-    if (
-      extraOptions?.limit !== undefined &&
-      extraOptions.limit > 0
-    ) {
+    if (extraOptions?.limit !== undefined && extraOptions.limit > 0) {
       const limit = Math.min(500, Math.max(1, extraOptions.limit));
       const page = Math.max(1, extraOptions.page || 1);
       const offset =
@@ -851,6 +1058,90 @@ export class Aggregator {
   }
 
   /**
+   * Event Timeline EPG API: buckets active events into chronological windows
+   * (live_now, starting_soon_2h, later_today, tomorrow, upcoming_later).
+   */
+  static async getTimeline(sportFilter?: string): Promise<TimelineResponse> {
+    const startTime = Date.now();
+    const catalog = await this.getUnifiedCatalog(sportFilter, "active", undefined, {
+      sort: "time_asc",
+    });
+
+    const now = Date.now();
+    const twoHoursFromNow = now + 2 * 3600 * 1000;
+    const todayYmd = new Date(now).toISOString().slice(0, 10);
+    const tomorrowYmd = new Date(now + 24 * 3600 * 1000).toISOString().slice(0, 10);
+
+    const bucketsMap: Record<TimelineBucket["id"], UnifiedFixture[]> = {
+      live_now: [],
+      starting_soon_2h: [],
+      later_today: [],
+      tomorrow: [],
+      upcoming_later: [],
+    };
+
+    for (const f of catalog.fixtures) {
+      if (f.phase === "live") {
+        bucketsMap.live_now.push(f);
+        continue;
+      }
+      const startMs = new Date(f.schedule.startTimeUtc).getTime();
+      const ymd = f.schedule.startTimeUtc.slice(0, 10);
+      if (startMs <= twoHoursFromNow) {
+        bucketsMap.starting_soon_2h.push(f);
+      } else if (ymd === todayYmd) {
+        bucketsMap.later_today.push(f);
+      } else if (ymd === tomorrowYmd) {
+        bucketsMap.tomorrow.push(f);
+      } else {
+        bucketsMap.upcoming_later.push(f);
+      }
+    }
+
+    const buckets: TimelineBucket[] = [
+      {
+        id: "live_now",
+        label: "Live Now",
+        count: bucketsMap.live_now.length,
+        fixtures: bucketsMap.live_now,
+      },
+      {
+        id: "starting_soon_2h",
+        label: "Starting Within 2 Hours",
+        count: bucketsMap.starting_soon_2h.length,
+        fixtures: bucketsMap.starting_soon_2h,
+      },
+      {
+        id: "later_today",
+        label: "Later Today",
+        count: bucketsMap.later_today.length,
+        fixtures: bucketsMap.later_today,
+      },
+      {
+        id: "tomorrow",
+        label: "Tomorrow",
+        count: bucketsMap.tomorrow.length,
+        fixtures: bucketsMap.tomorrow,
+      },
+      {
+        id: "upcoming_later",
+        label: "Upcoming This Week",
+        count: bucketsMap.upcoming_later.length,
+        fixtures: bucketsMap.upcoming_later,
+      },
+    ];
+
+    return {
+      status: "success",
+      apiVersion: "2.1.0",
+      timestamp: new Date().toISOString(),
+      executionTimeMs: Date.now() - startTime,
+      totalActiveEvents: catalog.fixtures.length,
+      buckets,
+    };
+  }
+
+  /**
    * Competitions & Tournaments Discovery API: aggregates all tournaments across the 6 providers.
    */
   static async getCompetitions(
@@ -971,6 +1262,127 @@ export class Aggregator {
   }
 
   /**
+   * Teams & Franchises Discovery API: aggregates all participating teams across the 6 providers.
+   */
+  static async getTeams(
+    sportFilter?: string,
+    searchQuery?: string
+  ): Promise<TeamsResponse> {
+    const catalog = await this.getUnifiedCatalog(sportFilter, "all");
+    const teamMap = new Map<
+      string,
+      {
+        summary: TeamSummary;
+        compsSet: Set<string>;
+      }
+    >();
+
+    for (const f of catalog.fixtures) {
+      if (!f.teams) continue;
+      for (const side of [f.teams.home, f.teams.away]) {
+        let entry = teamMap.get(side.id);
+        if (!entry) {
+          entry = {
+            summary: {
+              id: side.id,
+              name: side.name,
+              code: side.code,
+              logo: side.logo,
+              sportCategory: f.sportCategory,
+              sportLabel: f.sport,
+              liveMatchesCount: 0,
+              upcomingMatchesCount: 0,
+              totalFixturesCount: 0,
+              competitions: [],
+              nextMatchTimeUtc: undefined,
+            },
+            compsSet: new Set<string>(),
+          };
+          teamMap.set(side.id, entry);
+        }
+
+        entry.summary.totalFixturesCount += 1;
+        if (f.phase === "live") {
+          entry.summary.liveMatchesCount += 1;
+        } else if (f.phase === "upcoming") {
+          entry.summary.upcomingMatchesCount += 1;
+          if (
+            !entry.summary.nextMatchTimeUtc ||
+            f.schedule.startTimeUtc < entry.summary.nextMatchTimeUtc
+          ) {
+            entry.summary.nextMatchTimeUtc = f.schedule.startTimeUtc;
+          }
+        }
+        entry.compsSet.add(f.tournament.name);
+      }
+    }
+
+    let teams = Array.from(teamMap.values()).map((e) => ({
+      ...e.summary,
+      competitions: Array.from(e.compsSet),
+    }));
+
+    if (searchQuery && searchQuery.trim().length > 0) {
+      const q = searchQuery.toLowerCase().trim();
+      teams = teams.filter(
+        (t) =>
+          t.name.toLowerCase().includes(q) ||
+          t.code.toLowerCase() === q ||
+          t.id.toLowerCase().includes(q)
+      );
+    }
+
+    teams.sort(
+      (a, b) =>
+        b.liveMatchesCount - a.liveMatchesCount ||
+        b.upcomingMatchesCount - a.upcomingMatchesCount ||
+        a.name.localeCompare(b.name)
+    );
+
+    return {
+      status: "success",
+      apiVersion: "2.1.0",
+      timestamp: new Date().toISOString(),
+      totalTeams: teams.length,
+      teams,
+    };
+  }
+
+  /**
+   * Retrieves a single team/franchise and all its fixtures by team ID, slug, or short code.
+   */
+  static async getTeamById(idOrSlug: string): Promise<TeamDetailResponse | null> {
+    const clean = decodeURIComponent(idOrSlug).trim().toLowerCase();
+    const normalizedTarget = Normalizer.slugify(Normalizer.normalizeTeamName(clean));
+    const allTeams = await this.getTeams();
+    const target = allTeams.teams.find(
+      (t) =>
+        t.id.toLowerCase() === clean ||
+        t.id.toLowerCase() === `team_${clean}` ||
+        t.id.toLowerCase() === `team_${normalizedTarget}` ||
+        Normalizer.slugify(t.name) === clean ||
+        Normalizer.slugify(t.name) === normalizedTarget ||
+        t.code.toLowerCase() === clean
+    );
+    if (!target) return null;
+
+    const catalog = await this.getUnifiedCatalog(undefined, "all");
+    const fixtures = catalog.fixtures.filter(
+      (f) =>
+        f.teams &&
+        (f.teams.home.id === target.id || f.teams.away.id === target.id)
+    );
+
+    return {
+      status: "success",
+      apiVersion: "2.1.0",
+      timestamp: new Date().toISOString(),
+      team: target,
+      fixtures,
+    };
+  }
+
+  /**
    * Multi-entity search across Fixtures, Teams, Competitions, and Broadcasters.
    */
   static async searchMultiEntity(query: string): Promise<SearchEntityResult> {
@@ -999,7 +1411,14 @@ export class Aggregator {
     const tokens = cleanQuery.toLowerCase().split(/\s+/).filter(Boolean);
     const teamsMap = new Map<
       string,
-      { id: string; name: string; code: string; logo: string; sportCategory: string; activeFixturesCount: number }
+      {
+        id: string;
+        name: string;
+        code: string;
+        logo: string;
+        sportCategory: string;
+        activeFixturesCount: number;
+      }
     >();
     const broadcastersMap = new Map<
       string,
@@ -1113,7 +1532,8 @@ export class Aggregator {
         id: def.id,
         name: def.name,
         status: telemetry?.status || (totalFixtures > 0 ? "healthy" : "unknown"),
-        rawCatalogItems: snapshot?.providerItemCounts[def.key] ?? telemetry?.lastItemCount ?? 0,
+        rawCatalogItems:
+          snapshot?.providerItemCounts[def.key] ?? telemetry?.lastItemCount ?? 0,
         unifiedFixturesCount: totalFixtures,
         liveFixturesCount: liveFixtures,
         exclusiveFixturesCount: exclusiveFixtures,
@@ -1140,12 +1560,22 @@ export class Aggregator {
   }
 
   /**
-   * Platform Observability, Cache Statistics, and Data-Quality Diagnostics.
+   * Returns the complete source-to-output reconciliation report with per-provider accounting,
+   * explainable merge decisions, confidence scores, and prevented false merges.
+   */
+  static async getReconciliationReport(): Promise<FullReconciliationReport | null> {
+    const snapshot = await this.buildOrGetBaseCatalog();
+    return snapshot?.fullReconciliationReport || null;
+  }
+
+  /**
+   * Platform Observability, Latency Percentiles (p50/p95/p99), Cache Statistics, and Data-Quality Diagnostics.
    */
   static async getPlatformDiagnostics() {
     const snapshot = await this.buildOrGetBaseCatalog();
     const providersReport = await this.getProvidersReport();
     const cacheStats = EdgeCache.getStats();
+    const telemetry = EdgeTelemetry.getSnapshot();
 
     return {
       status: "success" as const,
@@ -1153,6 +1583,7 @@ export class Aggregator {
       timestamp: new Date().toISOString(),
       reconciliation: snapshot?.reconciliation || null,
       cache: cacheStats,
+      telemetry,
       indexSize: this.fixtureIndex.size,
       maxIndexSize: this.MAX_INDEX_ENTRIES,
       providersSummary: {
@@ -1316,6 +1747,9 @@ export class Aggregator {
           s.provenance.mirroredBy.some((m) => m.toLowerCase() === provFilter)
       );
     }
+    if (filterOptions?.drmFree === true) {
+      finalStreams = finalStreams.filter((s) => !s.drm || s.drm.type === "none");
+    }
 
     const availableLanguages = Array.from(
       new Set(deduplicatedStreams.map((s) => s.language.name))
@@ -1326,6 +1760,7 @@ export class Aggregator {
     const channelGroups = Array.from(
       new Set(deduplicatedStreams.map((s) => s.channelGroup))
     );
+    const mirrorGroups = StreamDeduplicator.buildMirrorGroups(finalStreams);
 
     return {
       status: "success",
@@ -1346,6 +1781,7 @@ export class Aggregator {
         availableLanguages,
         availableQualities,
         channelGroups,
+        mirrorGroups,
         audit,
       },
       streams: finalStreams,

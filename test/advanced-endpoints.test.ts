@@ -163,7 +163,7 @@ describe("Advanced API Capabilities & Endpoints", () => {
     expect(searchBody.results.teams[0].name).toBe("Arsenal");
   });
 
-  it("serves /api/providers and /api/stats with reconciliation and cache diagnostics", async () => {
+  it("serves /api/providers and /api/stats with reconciliation, latency telemetry, and cache diagnostics", async () => {
     mockRichCatalog();
 
     const statsRes = await app.request("http://localhost/api/stats");
@@ -173,11 +173,112 @@ describe("Advanced API Capabilities & Endpoints", () => {
     expect(statsBody.reconciliation.unmappedRawItemsCount).toBe(0);
     expect(statsBody.cache).toBeDefined();
     expect(statsBody.providersSummary.total).toBe(6);
+    expect(statsBody.telemetry).toBeDefined();
+    expect(typeof statsBody.telemetry.latency.p50Ms).toBe("number");
+    expect(typeof statsBody.telemetry.latency.p95Ms).toBe("number");
+    expect(typeof statsBody.telemetry.latency.p99Ms).toBe("number");
 
     const provRes = await app.request("http://localhost/api/providers");
     expect(provRes.status).toBe(200);
     const provBody = (await provRes.json()) as any;
     expect(provBody.providers).toHaveLength(6);
+  });
+
+  it("serves /api/reconciliation audit report with explainable merge decisions and confidence scores", async () => {
+    mockRichCatalog();
+
+    const reconRes = await app.request("http://localhost/api/reconciliation");
+    expect(reconRes.status).toBe(200);
+    const reconBody = (await reconRes.json()) as any;
+    expect(reconBody.status).toBe("verified_zero_loss");
+    expect(reconBody.summary.unmappedRawItemsCount).toBe(0);
+    expect(reconBody.summary.totalUnifiedFixtures).toBe(2);
+    expect(reconBody.providerAccounting).toHaveLength(6);
+    expect(reconBody.mergeDecisions).toHaveLength(1);
+    const arsenalMerge = reconBody.mergeDecisions.find(
+      (d: any) => d.title === "Arsenal vs Chelsea"
+    );
+    expect(arsenalMerge).toBeDefined();
+    expect(arsenalMerge.rawItemCount).toBe(2);
+    expect(arsenalMerge.confidenceScore).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it("serves /api/teams and /api/teams/:id for team discovery and fixture schedules", async () => {
+    mockRichCatalog();
+
+    const teamsRes = await app.request("http://localhost/api/teams?sport=football");
+    expect(teamsRes.status).toBe(200);
+    const teamsBody = (await teamsRes.json()) as any;
+    expect(teamsBody.totalTeams).toBe(2);
+    const arsenal = teamsBody.teams.find((t: any) => t.name === "Arsenal");
+    expect(arsenal).toBeDefined();
+    expect(arsenal.liveMatchesCount).toBe(1);
+
+    const detailRes = await app.request(`http://localhost/api/teams/${arsenal.id}`);
+    expect(detailRes.status).toBe(200);
+    const detailBody = (await detailRes.json()) as any;
+    expect(detailBody.team.name).toBe("Arsenal");
+    expect(detailBody.fixtures).toHaveLength(1);
+    expect(detailBody.fixtures[0].title).toBe("Arsenal vs Chelsea");
+  });
+
+  it("serves /api/timeline chronological EPG buckets", async () => {
+    mockRichCatalog();
+
+    const timelineRes = await app.request("http://localhost/api/timeline");
+    expect(timelineRes.status).toBe(200);
+    const timelineBody = (await timelineRes.json()) as any;
+    expect(timelineBody.totalActiveEvents).toBe(2);
+    expect(timelineBody.buckets).toHaveLength(5);
+    const liveBucket = timelineBody.buckets.find((b: any) => b.id === "live_now");
+    expect(liveBucket).toBeDefined();
+    expect(liveBucket.count).toBe(1);
+    expect(liveBucket.fixtures[0].title).toBe("Arsenal vs Chelsea");
+  });
+
+  it("supports drmFree=true filter and mirrorGroups on /api/stream/:fixtureKey", async () => {
+    mockRichCatalog();
+
+    vi.spyOn(UpstreamClient, "fetchStreams").mockImplementation(async (rawId: string) => {
+      if (rawId.startsWith("cnc:")) {
+        return [
+          {
+            name: "Sky Sports Main Event",
+            title: "Sky Sports 1080p (DRM)",
+            url: "https://cdn.example.com/sky/master.mpd?clearkey=0123456789abcdef0123456789abcdef:fedcba9876543210fedcba9876543210",
+          },
+          {
+            name: "Sky Sports Main Event",
+            title: "Sky Sports 720p (HLS)",
+            url: "https://cdn.example.com/sky/720p.m3u8",
+          },
+        ];
+      }
+      return [];
+    });
+
+    const catRes = await app.request("http://localhost/api/catalog");
+    const catBody = (await catRes.json()) as any;
+    const arsenalKey = catBody.fixtures.find(
+      (f: any) => f.title === "Arsenal vs Chelsea"
+    ).canonicalKey;
+
+    const allStreamsRes = await app.request(
+      `http://localhost/api/stream/${encodeURIComponent(arsenalKey)}?inspect=false`
+    );
+    expect(allStreamsRes.status).toBe(200);
+    const allStreamsBody = (await allStreamsRes.json()) as any;
+    expect(allStreamsBody.streams).toHaveLength(2);
+    expect(allStreamsBody.summary.mirrorGroups).toBeDefined();
+    expect(allStreamsBody.summary.mirrorGroups.length).toBeGreaterThanOrEqual(1);
+
+    const drmFreeRes = await app.request(
+      `http://localhost/api/stream/${encodeURIComponent(arsenalKey)}?inspect=false&drmFree=true`
+    );
+    expect(drmFreeRes.status).toBe(200);
+    const drmFreeBody = (await drmFreeRes.json()) as any;
+    expect(drmFreeBody.streams).toHaveLength(1);
+    expect(drmFreeBody.streams[0].drm).toBeNull();
   });
 
   it("blocks SSRF private/loopback targets on /api/proxy", async () => {
@@ -193,3 +294,4 @@ describe("Advanced API Capabilities & Endpoints", () => {
     expect(metaSsrfRes.status).toBe(400);
   });
 });
+

@@ -3,6 +3,7 @@ import {
   LanguageInfo,
   StreamAuditSummary,
   StreamExclusion,
+  ChannelMirrorGroup,
 } from "../types/stream.types";
 import { ChannelNormalizer } from "./channel-normalizer";
 import { DrmDetector } from "./drm";
@@ -33,6 +34,98 @@ export class StreamDeduplicator {
     "360p": { width: 640, height: 360 },
     "288p": { width: 512, height: 288 },
   };
+
+  private static LANGUAGE_RULES: Array<{
+    info: LanguageInfo;
+    textRegex: RegExp;
+    urlRegex?: RegExp;
+  }> = [
+    {
+      info: { code: "hin", name: "Hindi", badge: "HIN" },
+      textRegex: /\b(?:hin|hindi)\b/i,
+      urlRegex: /(?:\/|-|_)(?:hin|hindi)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "tam", name: "Tamil", badge: "TAM" },
+      textRegex: /\b(?:tam|tamil)\b/i,
+      urlRegex: /(?:\/|-|_)(?:tam|tamil)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "tel", name: "Telugu", badge: "TEL" },
+      textRegex: /\b(?:tel|telugu)\b/i,
+      urlRegex: /(?:\/|-|_)(?:tel|telugu)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "kan", name: "Kannada", badge: "KAN" },
+      textRegex: /\b(?:kan|kannada)\b/i,
+      urlRegex: /(?:\/|-|_)(?:kan|kannada)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "ben", name: "Bengali", badge: "BEN" },
+      textRegex: /\b(?:ben|bengali|bangla)\b/i,
+      urlRegex: /(?:\/|-|_)(?:ben|bengali)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "mal", name: "Malayalam", badge: "MAL" },
+      textRegex: /\b(?:mal|malayalam)\b/i,
+      urlRegex: /(?:\/|-|_)(?:mal|malayalam)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "mar", name: "Marathi", badge: "MAR" },
+      textRegex: /\b(?:mar|marathi)\b/i,
+      urlRegex: /(?:\/|-|_)(?:mar|marathi)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "guj", name: "Gujarati", badge: "GUJ" },
+      textRegex: /\b(?:guj|gujarati)\b/i,
+      urlRegex: /(?:\/|-|_)(?:guj|gujarati)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "pun", name: "Punjabi", badge: "PUN" },
+      textRegex: /\b(?:pun|punjabi)\b/i,
+      urlRegex: /(?:\/|-|_)(?:pun|punjabi)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "urd", name: "Urdu", badge: "URD" },
+      textRegex: /\b(?:urd|urdu)\b/i,
+      urlRegex: /(?:\/|-|_)(?:urd|urdu)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "spa", name: "Spanish", badge: "SPA" },
+      textRegex: /\b(?:spa|spanish|espanol|español)\b/i,
+      urlRegex: /(?:\/|-|_)(?:spa|spanish|esp)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "ara", name: "Arabic", badge: "ARA" },
+      textRegex: /\b(?:ara|arabic)\b/i,
+      urlRegex: /(?:\/|-|_)(?:ara|arabic)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "fra", name: "French", badge: "FRA" },
+      textRegex: /\b(?:fra|french|francais|français)\b/i,
+      urlRegex: /(?:\/|-|_)(?:fra|french)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "por", name: "Portuguese", badge: "POR" },
+      textRegex: /\b(?:por|portuguese|portugues|português)\b/i,
+      urlRegex: /(?:\/|-|_)(?:por|portuguese)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "deu", name: "German", badge: "DEU" },
+      textRegex: /\b(?:deu|ger|german|deutsch)\b/i,
+      urlRegex: /(?:\/|-|_)(?:deu|ger|german)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "ita", name: "Italian", badge: "ITA" },
+      textRegex: /\b(?:ita|italian|italiano)\b/i,
+      urlRegex: /(?:\/|-|_)(?:ita|italian)(?:\/|-|_|\.)/i,
+    },
+    {
+      info: { code: "rus", name: "Russian", badge: "RUS" },
+      textRegex: /\b(?:rus|russian)\b/i,
+      urlRegex: /(?:\/|-|_)(?:rus|russian)(?:\/|-|_|\.)/i,
+    },
+  ];
 
   /**
    * Identifies donation spam, promotional banners, or invalid candidates.
@@ -78,9 +171,9 @@ export class StreamDeduplicator {
 
   /**
    * Normalizes URL for fingerprint comparison:
-   * Strips dynamic tokens, nonces, and timestamp tracking parameters,
-   * while STRICTLY preserving quality variants (e.g. maxh=1080 vs maxh=720) so
-   * distinct resolution renditions are never falsely collapsed.
+   * Strips dynamic tokens, Akamai/CloudFront edge auth tokens, nonces, and timestamp tracking parameters,
+   * while STRICTLY preserving quality variants (e.g. maxh=1080 vs maxh=720) and DRM keys so
+   * distinct resolution renditions and mirrors are never falsely collapsed.
    */
   static getUrlFingerprint(url: string): string {
     try {
@@ -95,7 +188,7 @@ export class StreamDeduplicator {
         const drmQualifier = clearkey ? `::ck_${clearkey.slice(0, 8)}` : "";
         return `${nestedFingerprint}${qualityQualifier}${drmQualifier}`;
       }
-      // Remove ephemeral tracking query parameters and sort deterministically
+      // Remove ephemeral tracking / CDN edge-auth query parameters and sort deterministically
       const cleanEntries: [string, string][] = [];
       for (const [k, v] of u.searchParams.entries()) {
         const lowerKey = k.toLowerCase();
@@ -105,6 +198,12 @@ export class StreamDeduplicator {
           !lowerKey.includes("session") &&
           !lowerKey.includes("auth") &&
           !lowerKey.includes("sig") &&
+          !lowerKey.includes("hmac") &&
+          lowerKey !== "hdnea" &&
+          lowerKey !== "hdnts" &&
+          lowerKey !== "policy" &&
+          lowerKey !== "key-pair-id" &&
+          lowerKey !== "md5" &&
           !lowerKey.startsWith("h_") &&
           lowerKey !== "h" &&
           lowerKey !== "t"
@@ -137,6 +236,12 @@ export class StreamDeduplicator {
       }
     } catch {}
     const t = text.toLowerCase();
+    const dimMatch = t.match(/\b(\d{3,4})x(\d{3,4})\b/);
+    if (dimMatch) {
+      const h = parseInt(dimMatch[2], 10);
+      if (h >= 2160) return "4K";
+      if (h > 0) return `${h}p`;
+    }
     if (/\b(?:2160p|4k|uhd)\b/.test(t)) return "4K";
     if (/\b(?:1080p|fhd|1080)\b/.test(t)) return "1080p";
     if (/\b(?:720p|hd|720)\b/.test(t)) return "720p";
@@ -209,7 +314,9 @@ export class StreamDeduplicator {
       url.includes("msnetworks.net") ||
       url.includes("pv-cdn.net") ||
       url.includes("aiv-cdn.net") ||
-      url.includes("tamashaweb.com")
+      url.includes("tamashaweb.com") ||
+      url.includes("akamaized.net") ||
+      url.includes("slivcdn.com")
     ) {
       score += 0.10;
     }
@@ -220,49 +327,28 @@ export class StreamDeduplicator {
   }
 
   /**
-   * Parses language code and badges from stream title.
+   * Parses language code and badges from both stream title/name and URL path/query markers.
    */
-  static extractLanguage(text: string): LanguageInfo {
-    const lower = text.toLowerCase();
-    if (lower.includes("[hin]") || lower.includes("hindi") || lower.includes("(hin)")) {
-      return { code: "hin", name: "Hindi", badge: "HIN" };
+  static extractLanguage(text: string, url?: string): LanguageInfo {
+    const cleanText = text || "";
+    const cleanUrl = url || "";
+
+    // 1. Check title/name tokens first
+    for (const rule of this.LANGUAGE_RULES) {
+      if (rule.textRegex.test(cleanText)) {
+        return rule.info;
+      }
     }
-    if (lower.includes("[tam]") || lower.includes("tamil") || lower.includes("(tam)")) {
-      return { code: "tam", name: "Tamil", badge: "TAM" };
+
+    // 2. Check URL path / query language segments (e.g. /KAN/, /TEL/, /TAM/, /HIN/, -hin-, -tam-)
+    if (cleanUrl) {
+      for (const rule of this.LANGUAGE_RULES) {
+        if (rule.urlRegex && rule.urlRegex.test(cleanUrl)) {
+          return rule.info;
+        }
+      }
     }
-    if (lower.includes("[tel]") || lower.includes("telugu") || lower.includes("(tel)")) {
-      return { code: "tel", name: "Telugu", badge: "TEL" };
-    }
-    if (lower.includes("[ben]") || lower.includes("bengali") || lower.includes("(ben)")) {
-      return { code: "ben", name: "Bengali", badge: "BEN" };
-    }
-    if (lower.includes("[kan]") || lower.includes("kannada") || lower.includes("(kan)")) {
-      return { code: "kan", name: "Kannada", badge: "KAN" };
-    }
-    if (lower.includes("[mal]") || lower.includes("malayalam") || lower.includes("(mal)")) {
-      return { code: "mal", name: "Malayalam", badge: "MAL" };
-    }
-    if (lower.includes("[mar]") || lower.includes("marathi") || lower.includes("(mar)")) {
-      return { code: "mar", name: "Marathi", badge: "MAR" };
-    }
-    if (lower.includes("[urd]") || lower.includes("urdu") || lower.includes("(urd)")) {
-      return { code: "urd", name: "Urdu", badge: "URD" };
-    }
-    if (lower.includes("[spa]") || lower.includes("espanol") || lower.includes("spanish")) {
-      return { code: "spa", name: "Spanish", badge: "SPA" };
-    }
-    if (lower.includes("[ara]") || lower.includes("arabic") || lower.includes("(ara)")) {
-      return { code: "ara", name: "Arabic", badge: "ARA" };
-    }
-    if (lower.includes("[fra]") || lower.includes("french") || lower.includes("francais")) {
-      return { code: "fra", name: "French", badge: "FRA" };
-    }
-    if (lower.includes("[por]") || lower.includes("portuguese") || lower.includes("portugues")) {
-      return { code: "por", name: "Portuguese", badge: "POR" };
-    }
-    if (lower.includes("[deu]") || lower.includes("german") || lower.includes("deutsch")) {
-      return { code: "deu", name: "German", badge: "DEU" };
-    }
+
     return { code: "eng", name: "English", badge: "ENG" };
   }
 
@@ -271,6 +357,69 @@ export class StreamDeduplicator {
    */
   static cleanChannelName(rawName?: string, rawTitle?: string): { name: string; group: string } {
     return ChannelNormalizer.normalize(rawName, rawTitle);
+  }
+
+  /**
+   * Determines stream priority tier based on quality variant and multi-source confidence.
+   */
+  static determinePriorityTier(
+    qualityVariant: string,
+    isMultiSource: boolean,
+    channelName: string
+  ): "primary" | "secondary" | "tertiary" {
+    if (
+      qualityVariant === "396p" ||
+      qualityVariant === "360p" ||
+      qualityVariant === "288p"
+    ) {
+      return "tertiary";
+    }
+    if (
+      qualityVariant === "576p" ||
+      qualityVariant === "540p" ||
+      qualityVariant === "480p" ||
+      channelName === "Standard Feed"
+    ) {
+      return "secondary";
+    }
+    if (
+      qualityVariant === "4K" ||
+      qualityVariant === "1080p" ||
+      qualityVariant === "720p" ||
+      qualityVariant === "Auto"
+    ) {
+      return isMultiSource || qualityVariant === "1080p" || qualityVariant === "4K" || qualityVariant === "720p" || qualityVariant === "Auto"
+        ? "primary"
+        : "secondary";
+    }
+    return "secondary";
+  }
+
+  private static qualitySortRank(qualityVariant?: string): number {
+    switch (qualityVariant) {
+      case "4K":
+        return 100;
+      case "1080p":
+        return 90;
+      case "Auto":
+        return 85;
+      case "720p":
+        return 80;
+      case "576p":
+        return 60;
+      case "540p":
+        return 55;
+      case "480p":
+        return 50;
+      case "396p":
+        return 30;
+      case "360p":
+        return 25;
+      case "288p":
+        return 20;
+      default:
+        return 70;
+    }
   }
 
   public static PROVIDER_DISPLAY_NAMES: Record<string, string> = {
@@ -285,7 +434,7 @@ export class StreamDeduplicator {
   /**
    * Deduplicates multi-provider stream candidates with transparent audit logging:
    * Merges identical URLs, preserves separate quality renditions (1080p, 720p, etc.),
-   * parses top-level DRM keys, and calculates source confidence.
+   * extracts language from title + URL path, parses DRM keys, and ranks streams by quality & reliability.
    */
   static deduplicateWithAudit(
     rawStreams: Array<{
@@ -312,7 +461,7 @@ export class StreamDeduplicator {
       const url = item.url!.trim();
       const combinedTitle = `${item.title ?? ""} ${item.name ?? ""}`;
       const fingerprint = this.getUrlFingerprint(url);
-      const language = this.extractLanguage(combinedTitle);
+      const language = this.extractLanguage(combinedTitle, url);
       const { name: channelName, group: channelGroup } = this.cleanChannelName(
         item.name,
         item.title
@@ -324,6 +473,10 @@ export class StreamDeduplicator {
 
       const existing = fingerprintMap.get(fingerprint);
       if (existing) {
+        // Upgrade language if existing was default 'eng' and secondary provider had explicit language tag
+        if (existing.language.code === "eng" && language.code !== "eng") {
+          existing.language = language;
+        }
         // Record provenance only if from a distinct secondary provider
         if (
           item.providerKey !== existing.provenance.originProvider &&
@@ -341,9 +494,8 @@ export class StreamDeduplicator {
           const mirrorCount = existing.provenance.mirroredBy.length;
           existing.provenance.attributionBadge = `Multi-Source (${existing.provenance.originProviderName} + ${mirrorCount} Mirror${mirrorCount > 1 ? "s" : ""})`;
         }
-        // Slightly boost reliability if verified by multiple providers
+        // Boost reliability if verified by multiple providers
         existing.reliabilityScore = Math.min(99, existing.reliabilityScore + 2);
-        // Recalculate source confidence with multi-source boost
         const updatedConfidence = this.calculateSourceConfidence(
           url,
           true,
@@ -351,6 +503,11 @@ export class StreamDeduplicator {
         );
         existing.sourceConfidence = updatedConfidence.confidence;
         existing.confidenceTier = updatedConfidence.tier;
+        existing.priorityTier = this.determinePriorityTier(
+          existing.qualityVariant || "Auto",
+          existing.provenance.isMultiSource,
+          existing.channelName
+        );
       } else {
         const streamId = `feed_${Math.abs(this.hashString(fingerprint)).toString(16)}`;
         const headers = this.extractHeaders(url, item.behaviorHints?.proxyHeaders?.request);
@@ -365,7 +522,8 @@ export class StreamDeduplicator {
         const isHlsPath = pathname.endsWith(".m3u8");
         const isMp4Path = pathname.endsWith(".mp4");
         const isDash =
-          !isHlsPath && (pathname.endsWith(".mpd") || url.includes(".mpd") || combinedTitle.includes("DASH"));
+          !isHlsPath &&
+          (pathname.endsWith(".mpd") || url.includes(".mpd") || combinedTitle.includes("DASH"));
         const protocol: "hls" | "dash" | "mp4" = isMp4Path
           ? "mp4"
           : isDash
@@ -390,12 +548,17 @@ export class StreamDeduplicator {
           ? `&referer=${encodeURIComponent(headers["Referer"])}`
           : "";
         const edgeProxyFallbackUrl = `/api/proxy?url=${encodeURIComponent(url)}${refererParam}`;
+        const priorityTier = this.determinePriorityTier(
+          qualityVariant,
+          false,
+          channelName
+        );
 
         fingerprintMap.set(fingerprint, {
           streamId,
           channelName,
           channelGroup,
-          priorityTier: fingerprintMap.size === 0 ? "primary" : "secondary",
+          priorityTier,
           reliabilityScore: 92,
           sourceConfidence: confidence,
           confidenceTier: tier,
@@ -443,7 +606,17 @@ export class StreamDeduplicator {
       }
     }
 
-    const streams = Array.from(fingerprintMap.values());
+    // Sort streams deterministically: Primary before Secondary before Tertiary, then by quality rank, then by reliabilityScore
+    const tierRank = { primary: 3, secondary: 2, tertiary: 1 };
+    const streams = Array.from(fingerprintMap.values()).sort((a, b) => {
+      const tDiff = tierRank[b.priorityTier] - tierRank[a.priorityTier];
+      if (tDiff !== 0) return tDiff;
+      const qDiff =
+        this.qualitySortRank(b.qualityVariant) - this.qualitySortRank(a.qualityVariant);
+      if (qDiff !== 0) return qDiff;
+      return b.reliabilityScore - a.reliabilityScore;
+    });
+
     const audit: StreamAuditSummary = {
       totalRawStreams: rawStreams.length,
       validStreamsCount: streams.length,
@@ -452,6 +625,63 @@ export class StreamDeduplicator {
     };
 
     return { streams, audit };
+  }
+
+  /**
+   * Builds structured ChannelMirrorGroup summaries grouping streams by (channelName, language.code)
+   * so clients can inspect all available resolutions and CDN mirrors per broadcast channel.
+   */
+  static buildMirrorGroups(streams: UnifiedStream[]): ChannelMirrorGroup[] {
+    const groupsMap = new Map<
+      string,
+      {
+        channelName: string;
+        channelGroup: string;
+        language: LanguageInfo;
+        recommendedStreamId: string;
+        providersSet: Set<string>;
+        qualitiesSet: Set<string>;
+        hasDrm: boolean;
+        streamIds: string[];
+      }
+    >();
+
+    for (const s of streams) {
+      const key = `${s.channelName}::${s.language.code}`;
+      let entry = groupsMap.get(key);
+      if (!entry) {
+        entry = {
+          channelName: s.channelName,
+          channelGroup: s.channelGroup,
+          language: s.language,
+          recommendedStreamId: s.streamId,
+          providersSet: new Set<string>(),
+          qualitiesSet: new Set<string>(),
+          hasDrm: s.drm !== null,
+          streamIds: [],
+        };
+        groupsMap.set(key, entry);
+      }
+
+      entry.streamIds.push(s.streamId);
+      entry.qualitiesSet.add(s.qualityVariant || "Auto");
+      if (s.drm !== null) entry.hasDrm = true;
+      for (const src of s.provenance.sourceList) {
+        entry.providersSet.add(src.providerKey);
+      }
+    }
+
+    return Array.from(groupsMap.values()).map((g) => ({
+      channelName: g.channelName,
+      channelGroup: g.channelGroup,
+      language: g.language,
+      recommendedStreamId: g.recommendedStreamId,
+      totalMirrors: g.streamIds.length,
+      providers: Array.from(g.providersSet),
+      qualities: Array.from(g.qualitiesSet),
+      hasDrm: g.hasDrm,
+      streamIds: g.streamIds,
+    }));
   }
 
   /**
