@@ -1,0 +1,9 @@
+name = "api"
+main = "src/index.ts"
+compatibility_date = "2025-03-21"
+compatibility_flags = [ "nodejs_compat" ]
+account_id = "c21099d41068e39992ace4fb87339075"
+workers_dev = true
+
+[observability]
+enabled = true
