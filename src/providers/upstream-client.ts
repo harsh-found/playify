@@ -36,17 +36,25 @@ export class UpstreamClient {
   private static inFlightRequests = new Map<string, Promise<any>>();
   private static hostStates = new Map<string, CircuitBreakerState>();
   private static providerMetrics = new Map<string, ProviderFetchTelemetry>();
+  private static streamCache = new Map<string, { streams: UpstreamStream[]; expiresAt: number }>();
 
   private static totalRequests = 0;
   private static coalescedHits = 0;
 
   private static CIRCUIT_BREAKER_THRESHOLD = 3;
   private static CIRCUIT_BREAKER_RESET_MS = 60_000; // 1 minute cooldown
+  private static STREAM_CACHE_TTL_MS = 25_000; // 25s hot stream cache
+  private static MAX_STREAM_CACHE_ITEMS = 250;
+
+  static clearStreamCache(): void {
+    this.streamCache.clear();
+  }
 
   static resetCircuitBreakers(): void {
     this.hostStates.clear();
     this.inFlightRequests.clear();
     this.providerMetrics.clear();
+    this.streamCache.clear();
     this.totalRequests = 0;
     this.coalescedHits = 0;
   }
@@ -305,14 +313,36 @@ export class UpstreamClient {
   }
 
   /**
-   * Fetches raw streams for a specific ID across federated upstream hosts with coalescing.
+   * Fetches raw streams for a specific ID across federated upstream hosts with coalescing and hot LRU cache.
    */
   static async fetchStreams(rawId: string): Promise<UpstreamStream[]> {
+    const cached = this.streamCache.get(rawId);
+    if (cached) {
+      if (Date.now() < cached.expiresAt) {
+        // Re-insert for LRU order
+        this.streamCache.delete(rawId);
+        this.streamCache.set(rawId, cached);
+        return cached.streams;
+      }
+      this.streamCache.delete(rawId);
+    }
+
     const cacheKey = `upstream:stream:${rawId}`;
     return this.coalesce(cacheKey, async () => {
       const path = `/stream/tv/${encodeURIComponent(rawId)}.json`;
       const data = await this.speculativeFetch(path, 6000, 1500);
-      return validateUpstreamStreams(data?.streams);
+      const valid = validateUpstreamStreams(data?.streams);
+      if (valid.length > 0) {
+        if (this.streamCache.size >= this.MAX_STREAM_CACHE_ITEMS) {
+          const oldestKey = this.streamCache.keys().next().value;
+          if (oldestKey) this.streamCache.delete(oldestKey);
+        }
+        this.streamCache.set(rawId, {
+          streams: valid,
+          expiresAt: Date.now() + this.STREAM_CACHE_TTL_MS,
+        });
+      }
+      return valid;
     });
   }
 }

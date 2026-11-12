@@ -13,11 +13,19 @@ import {
   TimelineBucket,
   TimelineResponse,
   SearchEntityResult,
+  BroadcasterSummary,
+  BroadcastersResponse,
 } from "../types/catalog.types";
-import { StreamResponse, StreamFilterOptions, UnifiedStream } from "../types/stream.types";
+import {
+  StreamResponse,
+  StreamFilterOptions,
+  UnifiedStream,
+  StreamProviderAccounting,
+} from "../types/stream.types";
 import { decodeCncRawId } from "../types/upstream.types";
 import { UpstreamClient } from "./upstream-client";
 import { Normalizer } from "../core/normalizer";
+import { ChannelNormalizer } from "../core/channel-normalizer";
 import { EventIdentityEngine } from "../core/event-identity";
 import { StreamDeduplicator } from "../core/deduplicator";
 import { HlsInspector } from "../core/hls-inspector";
@@ -95,7 +103,8 @@ export class Aggregator {
   private static lastGoodCatalogResponse: CatalogResponse | null = null;
   private static baseCatalogSnapshot: BaseCatalogSnapshot | null = null;
   private static inFlightCatalogBuild: Promise<BaseCatalogSnapshot | null> | null = null;
-  private static BASE_SNAPSHOT_TTL_MS = 8_000;
+  private static BASE_SNAPSHOT_SOFT_TTL_MS = 45_000;
+  private static BASE_SNAPSHOT_HARD_TTL_MS = 300_000;
 
   private static indexFixture(key: string, fixture: UnifiedFixture, ttlMs = 3600_000): void {
     if (this.fixtureIndex.size >= this.MAX_INDEX_ENTRIES && !this.fixtureIndex.has(key)) {
@@ -246,18 +255,29 @@ export class Aggregator {
 
   /**
    * Builds (or coalesces) the normalized base catalog across all 6 upstream providers
-   * with full source-to-output reconciliation accounting and pre-computed secondary indexes.
+   * with Stale-While-Revalidate (soft/hard TTL), full source-to-output reconciliation accounting,
+   * and pre-computed secondary indexes.
    */
   private static async buildOrGetBaseCatalog(): Promise<BaseCatalogSnapshot | null> {
     const currentGen = EdgeCache.getGeneration();
-    if (
-      this.baseCatalogSnapshot &&
-      this.baseCatalogSnapshot.generation === currentGen &&
-      Date.now() - this.baseCatalogSnapshot.createdAt < this.BASE_SNAPSHOT_TTL_MS
-    ) {
-      return this.baseCatalogSnapshot;
+    if (this.baseCatalogSnapshot && this.baseCatalogSnapshot.generation === currentGen) {
+      const ageMs = Date.now() - this.baseCatalogSnapshot.createdAt;
+      if (ageMs < this.BASE_SNAPSHOT_SOFT_TTL_MS) {
+        return this.baseCatalogSnapshot;
+      }
+      if (ageMs < this.BASE_SNAPSHOT_HARD_TTL_MS) {
+        // Stale-While-Revalidate: trigger background refresh if not already running and return immediately
+        void this.refreshBaseCatalog(currentGen);
+        return this.baseCatalogSnapshot;
+      }
     }
 
+    return this.refreshBaseCatalog(currentGen);
+  }
+
+  private static async refreshBaseCatalog(
+    currentGen = EdgeCache.getGeneration()
+  ): Promise<BaseCatalogSnapshot | null> {
     if (this.inFlightCatalogBuild) {
       return this.inFlightCatalogBuild;
     }
@@ -1274,6 +1294,7 @@ export class Aggregator {
       {
         summary: TeamSummary;
         compsSet: Set<string>;
+        sportsSet: Set<string>;
       }
     >();
 
@@ -1290,6 +1311,7 @@ export class Aggregator {
               logo: side.logo,
               sportCategory: f.sportCategory,
               sportLabel: f.sport,
+              sports: [],
               liveMatchesCount: 0,
               upcomingMatchesCount: 0,
               totalFixturesCount: 0,
@@ -1297,6 +1319,7 @@ export class Aggregator {
               nextMatchTimeUtc: undefined,
             },
             compsSet: new Set<string>(),
+            sportsSet: new Set<string>(),
           };
           teamMap.set(side.id, entry);
         }
@@ -1314,11 +1337,13 @@ export class Aggregator {
           }
         }
         entry.compsSet.add(f.tournament.name);
+        entry.sportsSet.add(f.sportCategory);
       }
     }
 
     let teams = Array.from(teamMap.values()).map((e) => ({
       ...e.summary,
+      sports: Array.from(e.sportsSet),
       competitions: Array.from(e.compsSet),
     }));
 
@@ -1351,10 +1376,13 @@ export class Aggregator {
   /**
    * Retrieves a single team/franchise and all its fixtures by team ID, slug, or short code.
    */
-  static async getTeamById(idOrSlug: string): Promise<TeamDetailResponse | null> {
+  static async getTeamById(
+    idOrSlug: string,
+    sportFilter?: string
+  ): Promise<TeamDetailResponse | null> {
     const clean = decodeURIComponent(idOrSlug).trim().toLowerCase();
     const normalizedTarget = Normalizer.slugify(Normalizer.normalizeTeamName(clean));
-    const allTeams = await this.getTeams();
+    const allTeams = await this.getTeams(sportFilter);
     const target = allTeams.teams.find(
       (t) =>
         t.id.toLowerCase() === clean ||
@@ -1366,7 +1394,7 @@ export class Aggregator {
     );
     if (!target) return null;
 
-    const catalog = await this.getUnifiedCatalog(undefined, "all");
+    const catalog = await this.getUnifiedCatalog(sportFilter, "all");
     const fixtures = catalog.fixtures.filter(
       (f) =>
         f.teams &&
@@ -1379,6 +1407,104 @@ export class Aggregator {
       timestamp: new Date().toISOString(),
       team: target,
       fixtures,
+    };
+  }
+
+  /**
+   * Broadcasters & Channels Discovery API: aggregates canonical broadcast networks across all active/upcoming events.
+   */
+  static async getBroadcasters(
+    sportFilter?: string,
+    phaseFilter?: string
+  ): Promise<BroadcastersResponse> {
+    const catalog = await this.getUnifiedCatalog(
+      sportFilter,
+      phaseFilter || "active"
+    );
+
+    const bMap = new Map<
+      string,
+      {
+        summary: BroadcasterSummary;
+        sportsSet: Set<string>;
+        compsSet: Set<string>;
+        sampleFixtures: Array<{
+          fixtureId: string;
+          canonicalKey: string;
+          title: string;
+          sportCategory: string;
+          phase: string;
+        }>;
+      }
+    >();
+
+    for (const f of catalog.fixtures) {
+      const seenInFixture = new Set<string>();
+      for (const rawB of f.streamMetadata.primaryBroadcasters) {
+        const norm = ChannelNormalizer.normalize(rawB);
+        const id = `broadcaster_${Normalizer.slugify(norm.name)}`;
+        if (seenInFixture.has(id)) continue;
+        seenInFixture.add(id);
+
+        let entry = bMap.get(id);
+        if (!entry) {
+          entry = {
+            summary: {
+              id,
+              name: norm.name,
+              group: norm.group,
+              liveFixturesCount: 0,
+              upcomingFixturesCount: 0,
+              totalFixturesCount: 0,
+              sportsCovered: [],
+              competitionsCovered: [],
+              sampleFixtures: [],
+            },
+            sportsSet: new Set<string>(),
+            compsSet: new Set<string>(),
+            sampleFixtures: [],
+          };
+          bMap.set(id, entry);
+        }
+
+        entry.summary.totalFixturesCount += 1;
+        if (f.phase === "live") entry.summary.liveFixturesCount += 1;
+        else if (f.phase === "upcoming") entry.summary.upcomingFixturesCount += 1;
+
+        entry.sportsSet.add(f.sportCategory);
+        entry.compsSet.add(f.tournament.name);
+        if (entry.sampleFixtures.length < 6) {
+          entry.sampleFixtures.push({
+            fixtureId: f.fixtureId,
+            canonicalKey: f.canonicalKey,
+            title: f.title,
+            sportCategory: f.sportCategory,
+            phase: f.phase,
+          });
+        }
+      }
+    }
+
+    const broadcasters = Array.from(bMap.values())
+      .map((e) => ({
+        ...e.summary,
+        sportsCovered: Array.from(e.sportsSet),
+        competitionsCovered: Array.from(e.compsSet).slice(0, 10),
+        sampleFixtures: e.sampleFixtures,
+      }))
+      .sort(
+        (a, b) =>
+          b.liveFixturesCount - a.liveFixturesCount ||
+          b.totalFixturesCount - a.totalFixturesCount ||
+          a.name.localeCompare(b.name)
+      );
+
+    return {
+      status: "success",
+      apiVersion: "2.1.0",
+      timestamp: new Date().toISOString(),
+      totalBroadcasters: broadcasters.length,
+      broadcasters,
     };
   }
 
@@ -1605,96 +1731,152 @@ export class Aggregator {
     queryPointers?: Record<string, string>,
     filterOptions?: StreamFilterOptions
   ): Promise<StreamResponse> {
-    // 1. Resolve fixture pointers from bounded index
-    let pointers = queryPointers;
+    // 1. Resolve fixture pointers AND full providerRawIds from bounded index (never lose secondary rawIds when queryPointers is passed)
+    let pointers = queryPointers ? { ...queryPointers } : undefined;
     let providerRawIds: Record<string, string[]> | undefined;
     let canonicalKey = identifier;
 
-    if (!pointers || Object.keys(pointers).length === 0) {
-      const cached =
-        this.getFixtureFromIndex(identifier) ||
-        this.getFixtureFromIndex(identifier.replace(/^fixture:/, "")) ||
-        this.getFixtureFromIndex(`fixture:${identifier}`);
-      if (cached) {
-        pointers = cached.providerPointers;
-        providerRawIds = cached.providerRawIds;
-        canonicalKey = cached.canonicalKey;
-      }
-    }
+    let cached =
+      this.getFixtureFromIndex(identifier) ||
+      this.getFixtureFromIndex(identifier.replace(/^fixture:/, "")) ||
+      this.getFixtureFromIndex(`fixture:${identifier}`);
 
-    // If still no pointers, perform an initial catalog refresh to populate pointers
-    if (!pointers || Object.keys(pointers).length === 0) {
+    if (!cached && (!pointers || Object.keys(pointers).length === 0)) {
       await this.getUnifiedCatalog();
-      const cached =
+      cached =
         this.getFixtureFromIndex(identifier) ||
         this.getFixtureFromIndex(identifier.replace(/^fixture:/, "")) ||
         this.getFixtureFromIndex(`fixture:${identifier}`);
-      if (cached) {
-        pointers = cached.providerPointers;
-        providerRawIds = cached.providerRawIds;
-        canonicalKey = cached.canonicalKey;
+    }
+
+    if (cached) {
+      canonicalKey = cached.canonicalKey;
+      pointers = { ...(cached.providerPointers || {}), ...(pointers || {}) };
+      providerRawIds = cached.providerRawIds;
+    }
+
+    // Build lossless per-provider set of rawIds so multi-entry providers and explicit queryPointers are both queried
+    const providerRawIdSets = new Map<string, Set<string>>();
+    if (providerRawIds) {
+      for (const [pk, rids] of Object.entries(providerRawIds)) {
+        const set = providerRawIdSets.get(pk) || new Set<string>();
+        for (const rid of rids) {
+          if (rid) set.add(rid);
+        }
+        providerRawIdSets.set(pk, set);
+      }
+    }
+    if (pointers) {
+      for (const [pk, rid] of Object.entries(pointers)) {
+        if (!rid) continue;
+        const set = providerRawIdSets.get(pk) || new Set<string>();
+        set.add(rid);
+        providerRawIdSets.set(pk, set);
       }
     }
 
-    // Build lossless list of (providerKey, rawId) pairs
     const fetchPairs: Array<[string, string]> = [];
-    if (providerRawIds && Object.keys(providerRawIds).length > 0) {
-      for (const [pk, rids] of Object.entries(providerRawIds)) {
-        for (const rid of rids) {
-          fetchPairs.push([pk, rid]);
-        }
-      }
-    } else {
-      for (const [pk, rid] of Object.entries(pointers || {})) {
+    for (const [pk, set] of providerRawIdSets.entries()) {
+      for (const rid of set) {
         fetchPairs.push([pk, rid]);
       }
     }
 
-    const uniqueProvidersQueried = new Set(fetchPairs.map(([pk]) => pk)).size;
+    const uniqueProvidersQueried = providerRawIdSets.size;
 
-    // 2. Concurrently fetch streams from all provider pointers via UpstreamClient
+    // 2. Concurrently fetch streams from all provider pointers via UpstreamClient and record per-provider breakdown
     const rawStreamsList: any[] = [];
+    const providerStatsMap = new Map<
+      string,
+      { rawIdsQueried: number; rawStreamsReturned: number; maxLatencyMs: number }
+    >();
+
+    for (const [pk, set] of providerRawIdSets.entries()) {
+      providerStatsMap.set(pk, {
+        rawIdsQueried: set.size,
+        rawStreamsReturned: 0,
+        maxLatencyMs: 0,
+      });
+    }
 
     const streamResults = await Promise.allSettled(
       fetchPairs.map(async ([providerKey, rawId]) => {
+        const start = Date.now();
         const streams = await UpstreamClient.fetchStreams(rawId);
-        return streams.map((s) => ({ ...s, providerKey }));
+        const latencyMs = Date.now() - start;
+        return {
+          providerKey,
+          latencyMs,
+          streams: streams.map((s) => ({ ...s, providerKey })),
+        };
       })
     );
 
     for (const res of streamResults) {
       if (res.status === "fulfilled") {
-        rawStreamsList.push(...res.value);
+        const { providerKey, latencyMs, streams } = res.value;
+        rawStreamsList.push(...streams);
+        const stat = providerStatsMap.get(providerKey);
+        if (stat) {
+          stat.rawStreamsReturned += streams.length;
+          if (latencyMs > stat.maxLatencyMs) stat.maxLatencyMs = latencyMs;
+        }
       }
     }
+
+    const providersBreakdown: StreamProviderAccounting[] = Array.from(
+      providerStatsMap.entries()
+    ).map(([providerKey, stat]) => {
+      const def = this.CATALOG_DEFINITIONS.find((d) => d.key === providerKey);
+      return {
+        providerKey,
+        providerName: def?.name || providerKey,
+        rawIdsQueried: stat.rawIdsQueried,
+        rawStreamsReturned: stat.rawStreamsReturned,
+        status: stat.rawStreamsReturned > 0 ? "ok" : "empty",
+        latencyMs: stat.maxLatencyMs,
+      };
+    });
 
     // 3. Deduplicate across providers with lossless quality preservation and transparent audit
     const { streams: deduplicatedStreams, audit } =
       StreamDeduplicator.deduplicateWithAudit(rawStreamsList);
 
-    // 4. Inspect DRM configuration for all streams
+    // 4. Inspect DRM configuration for all streams and refresh playbackHints if DRM changed
     for (const stream of deduplicatedStreams) {
       const drm = DrmDetector.detectDrm(
         `${stream.channelName} ${stream.network.masterPlaylistUrl}`
       );
       if (drm && !stream.drm) {
         stream.drm = drm;
+        if (stream.playbackHints) {
+          stream.playbackHints.requiresClearKey = true;
+          stream.playbackHints.webHlsCompatible =
+            stream.protocol === "hls" && Boolean(stream.network.isBridgedStream);
+        }
       }
     }
 
-    // 5. Pre-parse HLS Master Playlists for the top streams (unless explicitly disabled)
+    // 5. Pre-parse HLS Master Playlists ONLY for true adaptive master playlists (skip single-resolution bridged streams)
     if (filterOptions?.inspectHls !== false) {
+      const inspectCandidates = deduplicatedStreams
+        .filter(
+          (s) =>
+            s.protocol === "hls" &&
+            !s.network.isBridgedStream &&
+            (!s.qualityVariant || s.qualityVariant === "Auto")
+        )
+        .slice(0, 4);
+
       await Promise.allSettled(
-        deduplicatedStreams.slice(0, 4).map(async (stream) => {
-          if (stream.protocol === "hls") {
-            const renditions = await HlsInspector.inspectStream(
-              stream.network.masterPlaylistUrl,
-              stream.network.requiredHeaders
-            );
-            if (renditions.length > 1) {
-              stream.hasPreParsedRenditions = true;
-              stream.renditions = renditions;
-            }
+        inspectCandidates.map(async (stream) => {
+          const renditions = await HlsInspector.inspectStream(
+            stream.network.masterPlaylistUrl,
+            stream.network.requiredHeaders
+          );
+          if (renditions.length > 1) {
+            stream.hasPreParsedRenditions = true;
+            stream.renditions = renditions;
           }
         })
       );
@@ -1747,8 +1929,21 @@ export class Aggregator {
           s.provenance.mirroredBy.some((m) => m.toLowerCase() === provFilter)
       );
     }
+    if (filterOptions?.channel) {
+      const chanFilter = filterOptions.channel.toLowerCase().trim();
+      finalStreams = finalStreams.filter(
+        (s) =>
+          s.channelName.toLowerCase().includes(chanFilter) ||
+          s.channelGroup.toLowerCase().includes(chanFilter)
+      );
+    }
     if (filterOptions?.drmFree === true) {
       finalStreams = finalStreams.filter((s) => !s.drm || s.drm.type === "none");
+    }
+    if (filterOptions?.playableOn === "web_hls") {
+      finalStreams = finalStreams.filter(
+        (s) => s.playbackHints?.webHlsCompatible === true
+      );
     }
 
     const availableLanguages = Array.from(
@@ -1773,6 +1968,8 @@ export class Aggregator {
         cached: true,
         ttlSeconds: 30,
       },
+      totalStreams: finalStreams.length,
+      availableResolutions: availableQualities,
       summary: {
         totalProvidersQueried: uniqueProvidersQueried,
         totalRawStreamsFound: rawStreamsList.length,
@@ -1782,6 +1979,7 @@ export class Aggregator {
         availableQualities,
         channelGroups,
         mirrorGroups,
+        providersBreakdown,
         audit,
       },
       streams: finalStreams,

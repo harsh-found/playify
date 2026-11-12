@@ -137,6 +137,8 @@ app.get("/", (c) => {
       competitionDetail: "/api/competitions/:id",
       teams: "/api/teams",
       teamDetail: "/api/teams/:id",
+      broadcasters: "/api/broadcasters",
+      channelsAlias: "/api/channels",
       multiEntitySearch: "/api/search?q=<query>",
       fixtureLookup: "/api/fixture/:id",
       sportsExplore: "/api/sports",
@@ -336,8 +338,9 @@ app.get("/api/teams", async (c) => {
 app.get("/api/teams/:id", async (c) => {
   const id = c.req.param("id");
   const decodedId = decodeURIComponent(id);
+  const sport = c.req.query("sport");
 
-  const detail = await Aggregator.getTeamById(decodedId);
+  const detail = await Aggregator.getTeamById(decodedId, sport);
   if (!detail) {
     return c.json(
       {
@@ -355,6 +358,25 @@ app.get("/api/teams/:id", async (c) => {
 
   return c.json(detail);
 });
+
+// 14b. Broadcasters & Channels Intelligence API: /api/broadcasters & /api/channels
+const handleBroadcastersRequest = async (c: any) => {
+  const sport = c.req.query("sport");
+  const phase = c.req.query("phase");
+  const cacheKey = `broadcasters:list:${sport ?? "all"}:${phase ?? "active"}`;
+  const cachedResponse = await EdgeCache.get(cacheKey, c.req.raw);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+
+  const broadcasters = await Aggregator.getBroadcasters(sport, phase);
+  const response = c.json(broadcasters);
+  await EdgeCache.put(cacheKey, c.req.raw, response, 30);
+  return response;
+};
+
+app.get("/api/broadcasters", handleBroadcastersRequest);
+app.get("/api/channels", handleBroadcastersRequest);
 
 // 15. Multi-Entity Search API: /api/search?q=india
 app.get("/api/search", async (c) => {
@@ -427,6 +449,8 @@ const handleStreamRequest = async (c: any) => {
   const quality = c.req.query("quality");
   const protocol = c.req.query("protocol");
   const provider = c.req.query("provider");
+  const channel = c.req.query("channel");
+  const playableOn = c.req.query("playableOn") as "web_hls" | "all" | undefined;
   const drmFreeRaw = c.req.query("drmFree");
   const drmFree = drmFreeRaw === "true" || drmFreeRaw === "1" ? true : undefined;
   const inspectRaw = c.req.query("inspect");
@@ -434,8 +458,15 @@ const handleStreamRequest = async (c: any) => {
     inspectRaw === "false" || inspectRaw === "0" ? false : true;
 
   const filterSuffix =
-    language || quality || protocol || provider || drmFree !== undefined || !inspectHls
-      ? `:${language ?? ""}:${quality ?? ""}:${protocol ?? ""}:${provider ?? ""}:${drmFree ?? ""}:${inspectHls}`
+    language ||
+    quality ||
+    protocol ||
+    provider ||
+    channel ||
+    playableOn ||
+    drmFree !== undefined ||
+    !inspectHls
+      ? `:${language ?? ""}:${quality ?? ""}:${protocol ?? ""}:${provider ?? ""}:${channel ?? ""}:${playableOn ?? ""}:${drmFree ?? ""}:${inspectHls}`
       : "";
 
   const cacheKey = `stream:unified:${decodedKey}${filterSuffix}`;
@@ -448,7 +479,16 @@ const handleStreamRequest = async (c: any) => {
     decodedKey,
     undefined,
     filterSuffix
-      ? { language, quality, protocol, provider, drmFree, inspectHls }
+      ? {
+          language,
+          quality,
+          protocol,
+          provider,
+          channel,
+          playableOn,
+          drmFree,
+          inspectHls,
+        }
       : undefined
   );
   const response = c.json(streams);

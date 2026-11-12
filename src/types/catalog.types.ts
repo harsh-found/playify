@@ -187,6 +187,7 @@ export interface TeamSummary {
   logo: string;
   sportCategory: string;
   sportLabel: string;
+  sports?: string[];
   liveMatchesCount: number;
   upcomingMatchesCount: number;
   totalFixturesCount: number;
@@ -208,6 +209,32 @@ export interface TeamDetailResponse {
   timestamp: string;
   team: TeamSummary;
   fixtures: UnifiedFixture[];
+}
+
+export interface BroadcasterSummary {
+  id: string;
+  name: string;
+  group: string;
+  liveFixturesCount: number;
+  upcomingFixturesCount: number;
+  totalFixturesCount: number;
+  sportsCovered: string[];
+  competitionsCovered: string[];
+  sampleFixtures: Array<{
+    fixtureId: string;
+    canonicalKey: string;
+    title: string;
+    sportCategory: string;
+    phase: string;
+  }>;
+}
+
+export interface BroadcastersResponse {
+  status: "success";
+  apiVersion: string;
+  timestamp: string;
+  totalBroadcasters: number;
+  broadcasters: BroadcasterSummary[];
 }
 
 export interface TimelineBucket {
@@ -245,3 +272,4 @@ export interface SearchEntityResult {
     broadcasters: Array<{ name: string; activeFixturesCount: number; sports: string[] }>;
   };
 }
+

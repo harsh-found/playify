@@ -1,4 +1,5 @@
 import { HlsInspector } from "./hls-inspector";
+import { UpstreamClient } from "../providers/upstream-client";
 
 /**
  * Cloudflare Edge Cache API wrapper with in-memory fallback for local dev & testing.
@@ -221,5 +222,6 @@ export class EdgeCache {
       evictions: 0,
     };
     HlsInspector.clearCache();
+    UpstreamClient.clearStreamCache();
   }
 }

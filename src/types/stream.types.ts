@@ -29,8 +29,18 @@ export interface LanguageInfo {
 
 export interface StreamNetworkInfo {
   masterPlaylistUrl: string;
+  directOriginUrl?: string | null;
+  isBridgedStream?: boolean;
   edgeProxyFallbackUrl?: string | null;
   requiredHeaders?: Record<string, string>;
+}
+
+export interface StreamPlaybackHints {
+  webHlsCompatible: boolean;
+  directDashAvailable: boolean;
+  requiresClearKey: boolean;
+  requiresCustomHeaders: boolean;
+  recommendedPlayer: "hls.js" | "shaka-player" | "mpegts.js" | "native";
 }
 
 export interface StreamSourceDetail {
@@ -50,7 +60,12 @@ export interface StreamProvenance {
 }
 
 export interface StreamExclusion {
-  reason: "DONATION_SPAM" | "MISSING_URL" | "INVALID_SCHEME" | "UNSUPPORTED_PROTOCOL";
+  reason:
+    | "DONATION_SPAM"
+    | "MISSING_URL"
+    | "INVALID_SCHEME"
+    | "UNSUPPORTED_PROTOCOL"
+    | "NON_MEDIA_URL";
   provider: string;
   details: string;
 }
@@ -60,6 +75,15 @@ export interface StreamAuditSummary {
   validStreamsCount: number;
   excludedStreamsCount: number;
   exclusions: StreamExclusion[];
+}
+
+export interface StreamProviderAccounting {
+  providerKey: string;
+  providerName: string;
+  rawIdsQueried: number;
+  rawStreamsReturned: number;
+  status: "ok" | "empty" | "failed";
+  latencyMs: number;
 }
 
 export interface UnifiedStream {
@@ -75,6 +99,7 @@ export interface UnifiedStream {
   protocol: "hls" | "dash" | "mp4";
   drm: DrmConfiguration | null;
   network: StreamNetworkInfo;
+  playbackHints?: StreamPlaybackHints;
   provenance: StreamProvenance;
   hasPreParsedRenditions: boolean;
   renditions: StreamRendition[];
@@ -97,7 +122,9 @@ export interface StreamFilterOptions {
   quality?: string;
   protocol?: string;
   provider?: string;
+  channel?: string;
   drmFree?: boolean;
+  playableOn?: "web_hls" | "all";
   inspectHls?: boolean;
 }
 
@@ -107,6 +134,8 @@ export interface StreamResponse {
   fixtureId: string;
   canonicalKey: string;
   generatedAt: string;
+  totalStreams?: number;
+  availableResolutions?: string[];
   edge: {
     region: string;
     cached: boolean;
@@ -119,9 +148,12 @@ export interface StreamResponse {
     recommendedDefaultStreamId: string;
     availableLanguages?: string[];
     availableQualities?: string[];
+    availableResolutions?: string[];
     channelGroups?: string[];
     mirrorGroups?: ChannelMirrorGroup[];
+    providersBreakdown?: StreamProviderAccounting[];
     audit?: StreamAuditSummary;
   };
   streams: UnifiedStream[];
 }
+

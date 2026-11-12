@@ -378,6 +378,12 @@ export class Normalizer {
       sportCategory: "american_football",
       regex: /\b(nfl\s*(?:\||vs\.?)?\s*red\s*zone|red\s*zone)\b/i,
     },
+    {
+      canonicalKey: "tennis::stockholm-open::channel",
+      displayName: "Stockholm Open",
+      sportCategory: "tennis",
+      regex: /\b(stockholm\s*open|atp\s*250\s*(?:&|vs\.?)\s*(?:wta\s*hong\s*kong|stockholm\s*open))\b/i,
+    },
   ];
 
   /**
@@ -1030,16 +1036,24 @@ export class Normalizer {
   }
 
   /**
-   * Normalizes tournament/competition names: strips country flag emojis, redundant sport prefixes, and unifies common synonyms.
+   * Normalizes tournament/competition names: strips country flag emojis, trailing stage suffixes, and unifies common synonyms.
    */
   static normalizeTournamentName(raw: string): string {
     if (!raw) return "";
     let cleaned = repairMojibake(raw)
       .replace(
-        /[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{1F900}-\u{1F9FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{200D}\u{FE0F}]/gu,
+        /[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{1F900}-\u{1F9FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{200B}-\u{200F}\u{202A}-\u{202E}\u{2060}-\u{206F}\u{200D}\u{FE0F}\u{FEFF}]/gu,
         ""
       )
       .replace(/\s+/g, " ")
+      .trim();
+
+    // Strip trailing stage/match-number suffixes (e.g. "SAFF Championship | 1st Semi-final" -> "SAFF Championship", "U19 Asia Cup | Final" -> "U19 Asia Cup")
+    cleaned = cleaned
+      .replace(
+        /\s*(?:\||-)\s*(?:\d+(?:st|nd|rd|th)\s+)?(?:semi-?finals?|quarter-?finals?|finals?|match\s*\d+|game\s*\d+|test|odi|t20i?)\s*$/i,
+        ""
+      )
       .trim();
 
     if (/^nfl\s*\|\s*nfl\s*redzone$/i.test(cleaned) || /^nfl\s*(?:vs\.?\s*)?redzone$/i.test(cleaned)) {
@@ -1050,6 +1064,12 @@ export class Normalizer {
     }
     if (/^womens?\s+emerging\s+nations\s+trophy$/i.test(cleaned)) {
       return "Women's Emerging Nations Trophy";
+    }
+    if (/^women'?s\s+big\s+bash\s+league(?:\s*\(wbbl\))?$/i.test(cleaned) || /^wbbl$/i.test(cleaned)) {
+      return "Women's Big Bash League (WBBL)";
+    }
+    if (/^nepal\s+premier\s+league(?:\s*\(npl\))?$/i.test(cleaned) || /^npl$/i.test(cleaned)) {
+      return "Nepal Premier League (NPL)";
     }
     if (/^uefa\s+nations$/i.test(cleaned)) {
       return "UEFA Nations League";
@@ -1065,6 +1085,12 @@ export class Normalizer {
     }
     if (/^stockholm\s+open$/i.test(cleaned)) {
       return "Stockholm Open";
+    }
+    if (/^tour\s+de\s+france$/i.test(cleaned)) {
+      return "Tour de France";
+    }
+    if (/^the\s*-\s*golazo\s+show$/i.test(cleaned)) {
+      return "The Golazo Show";
     }
     return cleaned;
   }
@@ -1092,6 +1118,7 @@ export class Normalizer {
     let teamBLogo = "";
     let tournamentName = "";
     let tournamentLogo = "";
+    let showSubtitle = "";
     let posterCard = "";
     let bannerWide = "";
     let startTime = "";
@@ -1146,6 +1173,7 @@ export class Normalizer {
           const t = typeof f === "string" ? f : f?.title;
           if (t && !t.toLowerCase().includes("support") && !t.toLowerCase().includes("goal")) {
             const cleanBroadcaster = repairMojibake(t)
+              .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
               .replace(/\s*-\s*(AQ|ALT|FHD|HD|SD).*/i, "")
               .trim();
             if (cleanBroadcaster.length > 2) {
@@ -1154,6 +1182,7 @@ export class Normalizer {
             if (/\b(hindi|hin|star\s*sports\s*1\s*hindi)\b/i.test(t)) detectedLanguages.add("Hindi");
             if (/\b(tamil|tam)\b/i.test(t)) detectedLanguages.add("Tamil");
             if (/\b(telugu|tel)\b/i.test(t)) detectedLanguages.add("Telugu");
+            if (/\b(kannada|kan)\b/i.test(t)) detectedLanguages.add("Kannada");
             if (/\b(bengali|ben)\b/i.test(t)) detectedLanguages.add("Bengali");
             if (/\b(urdu|urd|tapmad|ptv|tamasha|a\s*sports)\b/i.test(t)) detectedLanguages.add("Urdu");
             if (/\b(spanish|espanol|movistar|espn\s*deportes)\b/i.test(t))
@@ -1171,6 +1200,16 @@ export class Normalizer {
       }
       if (info.eventBanner && typeof info.eventBanner === "string" && info.eventBanner.startsWith("http") && !bannerWide) {
         bannerWide = info.eventBanner;
+      }
+
+      // Extract show subtitle if eventName has "Formula 1 - Las Vegas Grand Prix" or "MotoGP - Grand Premio de Portugal" or "ONE FRIDAY FIGHTS 178"
+      if (typeof info.eventName === "string") {
+        const subMatch = info.eventName.match(/^(?:Formula\s*1|MotoGP)\s*-\s*(.+)$/i);
+        if (subMatch && subMatch[1].trim() && !showSubtitle) {
+          showSubtitle = subMatch[1].trim();
+        } else if (/^ONE\s+FRIDAY\s+FIGHTS\s+\d+$/i.test(info.eventName.trim()) && !showSubtitle) {
+          showSubtitle = info.eventName.trim();
+        }
       }
 
       // Extract best normalized teams from candidate as an atomic pair
@@ -1221,8 +1260,11 @@ export class Normalizer {
       if (info.isEnded) candidateEndedCount++;
     }
 
-    // Determine Sport Classification across all candidate signals
-    const sampleText = `${candidates.map((c) => c.name).join(" ")} ${tournamentName} ${posterTitle} ${teamAName} ${teamBName}`;
+    // Determine Sport Classification across all candidate signals (including raw eventName/eventType so stage tokens like Semi-final/Final are preserved)
+    const rawEventNames = candidates
+      .map((c) => `${c.name} ${c.eventInfo?.eventName ?? ""} ${c.eventInfo?.eventType ?? ""}`)
+      .join(" ");
+    const sampleText = `${rawEventNames} ${tournamentName} ${posterTitle} ${teamAName} ${teamBName}`;
     const sportClassification = this.classifySport(sampleText, rawSport);
 
     if (sportClassification.category === "cricket") {
@@ -1395,7 +1437,7 @@ export class Normalizer {
         name: tournamentName,
         shortName:
           tournamentName.length > 25 ? `${tournamentName.slice(0, 22)}...` : tournamentName,
-        stage: identity.stage,
+        stage: identity.stage || showSubtitle || undefined,
         logo: tournamentLogo || posterCard,
         category: sportClassification.label,
       },
@@ -1421,7 +1463,7 @@ export class Normalizer {
       eventDetails: {
         format: identity.format,
         matchNumber: identity.matchNumber,
-        stage: identity.stage,
+        stage: identity.stage || showSubtitle || undefined,
         gender: identity.gender,
         ageGroup: identity.ageGroup,
       },

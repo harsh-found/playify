@@ -92,43 +92,43 @@ export class StreamDeduplicator {
     },
     {
       info: { code: "spa", name: "Spanish", badge: "SPA" },
-      textRegex: /\b(?:spa|spanish|espanol|español)\b/i,
+      textRegex: /(?:\b(?:spa|spanish|espanol|español|vix\s+espanol)\b|🇪🇸|🇲🇽|🇦🇷)/iu,
       urlRegex: /(?:\/|-|_)(?:spa|spanish|esp)(?:\/|-|_|\.)/i,
     },
     {
       info: { code: "ara", name: "Arabic", badge: "ARA" },
-      textRegex: /\b(?:ara|arabic)\b/i,
+      textRegex: /(?:\b(?:ara|arabic)\b|🇸🇦|🇦🇪|🇶🇦|🇪🇬)/iu,
       urlRegex: /(?:\/|-|_)(?:ara|arabic)(?:\/|-|_|\.)/i,
     },
     {
       info: { code: "fra", name: "French", badge: "FRA" },
-      textRegex: /\b(?:fra|french|francais|français)\b/i,
+      textRegex: /(?:\b(?:fra|french|francais|français|auvio)\b|🇫🇷|🇧🇪)/iu,
       urlRegex: /(?:\/|-|_)(?:fra|french)(?:\/|-|_|\.)/i,
     },
     {
       info: { code: "por", name: "Portuguese", badge: "POR" },
-      textRegex: /\b(?:por|portuguese|portugues|português)\b/i,
-      urlRegex: /(?:\/|-|_)(?:por|portuguese)(?:\/|-|_|\.)/i,
+      textRegex: /(?:\b(?:por|portuguese|portugues|português|brasil|sportv(?:\s*\d+)?\s*br)\b|🇧🇷|🇵🇹)/iu,
+      urlRegex: /(?:\/|-|_)(?:por|portuguese|pt-br)(?:\/|-|_|\.)/i,
     },
     {
       info: { code: "deu", name: "German", badge: "DEU" },
-      textRegex: /\b(?:deu|ger|german|deutsch)\b/i,
+      textRegex: /(?:\b(?:deu|ger|german|deutsch|sport\s*1\s*de)\b|🇩🇪|🇦🇹)/iu,
       urlRegex: /(?:\/|-|_)(?:deu|ger|german)(?:\/|-|_|\.)/i,
     },
     {
       info: { code: "ita", name: "Italian", badge: "ITA" },
-      textRegex: /\b(?:ita|italian|italiano)\b/i,
+      textRegex: /(?:\b(?:ita|italian|italiano|sky\s*italia)\b|🇮🇹)/iu,
       urlRegex: /(?:\/|-|_)(?:ita|italian)(?:\/|-|_|\.)/i,
     },
     {
       info: { code: "rus", name: "Russian", badge: "RUS" },
-      textRegex: /\b(?:rus|russian)\b/i,
+      textRegex: /(?:\b(?:rus|russian|russia\s+feed)\b|🇷🇺)/iu,
       urlRegex: /(?:\/|-|_)(?:rus|russian)(?:\/|-|_|\.)/i,
     },
   ];
 
   /**
-   * Identifies donation spam, promotional banners, or invalid candidates.
+   * Identifies donation spam, promotional banners, non-media API URLs, or invalid candidates.
    */
   static checkExclusion(item: {
     url?: string;
@@ -159,6 +159,18 @@ export class StreamDeduplicator {
         details: `Disallowed protocol scheme: ${url.slice(0, 10)}`,
       };
     }
+    // Filter out non-media JSON API endpoints (e.g. kick.com/api/v2/channels/...) unless they wrap an .m3u8/.mpd
+    if (
+      /\/api\/v\d+\/channels\//i.test(url) &&
+      !url.toLowerCase().includes(".m3u8") &&
+      !url.toLowerCase().includes(".mpd")
+    ) {
+      return {
+        reason: "NON_MEDIA_URL",
+        provider: item.providerKey,
+        details: `Non-playable JSON API endpoint: ${url.slice(0, 60)}`,
+      };
+    }
     return null;
   }
 
@@ -167,6 +179,20 @@ export class StreamDeduplicator {
    */
   static isSpam(title?: string, name?: string, url?: string): boolean {
     return this.checkExclusion({ title, name, url, providerKey: "unknown" }) !== null;
+  }
+
+  /**
+   * Extracts the direct origin manifest URL when a stream is wrapped inside a MediaFlow / HLS decryptor bridge (?d=https://...).
+   */
+  static extractDirectOriginUrl(url: string): string | null {
+    try {
+      const u = new URL(url);
+      const nested = u.searchParams.get("d");
+      if (nested && (nested.startsWith("http://") || nested.startsWith("https://"))) {
+        return nested;
+      }
+    } catch {}
+    return null;
   }
 
   /**
@@ -433,8 +459,8 @@ export class StreamDeduplicator {
 
   /**
    * Deduplicates multi-provider stream candidates with transparent audit logging:
-   * Merges identical URLs, preserves separate quality renditions (1080p, 720p, etc.),
-   * extracts language from title + URL path, parses DRM keys, and ranks streams by quality & reliability.
+   * Merges identical URLs, upgrades metadata across providers, preserves separate quality renditions (1080p, 720p, etc.),
+   * extracts language from title + URL path, parses DRM keys & direct origin URLs, and ranks streams by quality & reliability.
    */
   static deduplicateWithAudit(
     rawStreams: Array<{
@@ -467,17 +493,86 @@ export class StreamDeduplicator {
         item.title
       );
       const qualityVariant = this.extractQualityVariant(combinedTitle, url);
+      const bitrate = this.extractBitrateBps(combinedTitle);
+      const incomingDrm = DrmDetector.detectDrm(
+        `${channelName} ${url} ${combinedTitle}`,
+        item.clearkey
+      );
 
       const providerDisplayName =
         this.PROVIDER_DISPLAY_NAMES[item.providerKey] ?? item.providerKey;
 
       const existing = fingerprintMap.get(fingerprint);
       if (existing) {
-        // Upgrade language if existing was default 'eng' and secondary provider had explicit language tag
+        // 1. Upgrade language if existing was default 'eng' and secondary provider had explicit language tag
         if (existing.language.code === "eng" && language.code !== "eng") {
           existing.language = language;
         }
-        // Record provenance only if from a distinct secondary provider
+
+        // 2. Upgrade channel identity if existing was generic "Standard Feed" or "General Sports"
+        if (
+          (existing.channelName === "Standard Feed" ||
+            existing.channelGroup === "General Sports") &&
+          channelGroup !== "General Sports"
+        ) {
+          existing.channelName = channelName;
+          existing.channelGroup = channelGroup;
+        }
+
+        // 3. Upgrade qualityVariant & rendition if secondary provider provides higher explicit resolution or bitrate
+        if (
+          qualityVariant !== "Auto" &&
+          this.qualitySortRank(qualityVariant) > this.qualitySortRank(existing.qualityVariant)
+        ) {
+          existing.qualityVariant = qualityVariant;
+          const dims = this.RESOLUTION_DIMENSIONS[qualityVariant] || { width: 0, height: 0 };
+          if (existing.renditions[0]) {
+            existing.renditions[0].qualityTag = qualityVariant;
+            existing.renditions[0].label = `${qualityVariant} (Adaptive)`;
+            existing.renditions[0].height = dims.height;
+            existing.renditions[0].width = dims.width;
+          }
+        }
+        if (existing.renditions[0] && bitrate > existing.renditions[0].bitrate) {
+          existing.renditions[0].bitrate = bitrate;
+        }
+
+        // 4. Upgrade DRM if existing lacked DRM or lacked ClearKey keys
+        if (
+          incomingDrm &&
+          (!existing.drm || (!existing.drm.keys?.length && incomingDrm.keys?.length))
+        ) {
+          existing.drm = incomingDrm;
+        }
+
+        // 5. Merge any additional required headers from secondary provider
+        const extraHeaders = this.extractHeaders(url, item.behaviorHints?.proxyHeaders?.request);
+        if (existing.network.requiredHeaders) {
+          for (const [hk, hv] of Object.entries(extraHeaders)) {
+            if (
+              hv &&
+              (!existing.network.requiredHeaders[hk] ||
+                (hk === "User-Agent" &&
+                  existing.network.requiredHeaders[hk] ===
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"))
+            ) {
+              existing.network.requiredHeaders[hk] = hv;
+            }
+          }
+          if (
+            existing.playbackHints &&
+            Boolean(
+              existing.network.requiredHeaders["Referer"] ||
+                existing.network.requiredHeaders["Origin"] ||
+                existing.network.requiredHeaders["User-Agent"] !==
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            )
+          ) {
+            existing.playbackHints.requiresCustomHeaders = true;
+          }
+        }
+
+        // 6. Record provenance only if from a distinct secondary provider
         if (
           item.providerKey !== existing.provenance.originProvider &&
           !existing.provenance.mirroredBy.includes(item.providerKey)
@@ -494,6 +589,7 @@ export class StreamDeduplicator {
           const mirrorCount = existing.provenance.mirroredBy.length;
           existing.provenance.attributionBadge = `Multi-Source (${existing.provenance.originProviderName} + ${mirrorCount} Mirror${mirrorCount > 1 ? "s" : ""})`;
         }
+
         // Boost reliability if verified by multiple providers
         existing.reliabilityScore = Math.min(99, existing.reliabilityScore + 2);
         const updatedConfidence = this.calculateSourceConfidence(
@@ -511,6 +607,8 @@ export class StreamDeduplicator {
       } else {
         const streamId = `feed_${Math.abs(this.hashString(fingerprint)).toString(16)}`;
         const headers = this.extractHeaders(url, item.behaviorHints?.proxyHeaders?.request);
+        const directOriginUrl = this.extractDirectOriginUrl(url);
+        const isBridgedStream = Boolean(directOriginUrl);
 
         let pathname = "";
         try {
@@ -519,7 +617,7 @@ export class StreamDeduplicator {
           pathname = url.split("?")[0].toLowerCase();
         }
 
-        const isHlsPath = pathname.endsWith(".m3u8");
+        const isHlsPath = pathname.endsWith(".m3u8") || url.toLowerCase().includes(".m3u8");
         const isMp4Path = pathname.endsWith(".mp4");
         const isDash =
           !isHlsPath &&
@@ -530,11 +628,7 @@ export class StreamDeduplicator {
           ? "dash"
           : "hls";
 
-        // Parse DRM from explicit property, URL, and title
-        const drm = DrmDetector.detectDrm(
-          `${channelName} ${url} ${combinedTitle}`,
-          item.clearkey
-        );
+        const drm = incomingDrm;
 
         const { confidence, tier } = this.calculateSourceConfidence(
           url,
@@ -543,7 +637,6 @@ export class StreamDeduplicator {
         );
 
         const dims = this.RESOLUTION_DIMENSIONS[qualityVariant] || { width: 0, height: 0 };
-        const bitrate = this.extractBitrateBps(combinedTitle);
         const refererParam = headers["Referer"]
           ? `&referer=${encodeURIComponent(headers["Referer"])}`
           : "";
@@ -553,6 +646,16 @@ export class StreamDeduplicator {
           false,
           channelName
         );
+
+        const isMpegTs =
+          pathname.endsWith(".ts") || /[?&]extension=ts\b/i.test(url);
+        const directDashAvailable =
+          protocol === "dash" ||
+          Boolean(directOriginUrl && directOriginUrl.toLowerCase().includes(".mpd"));
+        const requiresClearKey = Boolean(drm && drm.type === "clearkey");
+        const requiresCustomHeaders = Boolean(headers["Referer"] || headers["Origin"]);
+        const webHlsCompatible =
+          (protocol === "hls" && !isMpegTs && (!drm || isBridgedStream)) || isBridgedStream;
 
         fingerprintMap.set(fingerprint, {
           streamId,
@@ -568,15 +671,29 @@ export class StreamDeduplicator {
           drm,
           network: {
             masterPlaylistUrl: url,
+            ...(directOriginUrl ? { directOriginUrl, isBridgedStream: true } : {}),
             edgeProxyFallbackUrl,
             requiredHeaders: headers,
+          },
+          playbackHints: {
+            webHlsCompatible,
+            directDashAvailable,
+            requiresClearKey,
+            requiresCustomHeaders,
+            recommendedPlayer: isMpegTs
+              ? "mpegts.js"
+              : protocol === "dash"
+              ? "shaka-player"
+              : protocol === "mp4"
+              ? "native"
+              : "hls.js",
           },
           provenance: {
             originProvider: item.providerKey,
             originProviderName: providerDisplayName,
             mirroredBy: [],
-            isMultiSource: false,
             isExclusive: true,
+            isMultiSource: false,
             sourceList: [
               {
                 providerKey: item.providerKey,

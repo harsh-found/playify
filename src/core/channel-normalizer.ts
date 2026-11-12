@@ -4,9 +4,9 @@
  * stream titles into pristine canonical broadcast network names.
  */
 export class ChannelNormalizer {
-  // Regex matching all emoji blocks, country flags, and symbols
+  // Regex matching all emoji blocks, country flags, symbols, and zero-width/directional marks
   private static EMOJI_REGEX =
-    /[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{1F900}-\u{1F9FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{200D}\u{FE0F}]/gu;
+    /[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{1F900}-\u{1F9FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{200B}-\u{200F}\u{202A}-\u{202E}\u{2060}-\u{206F}\u{FE0F}\u{FEFF}]/gu;
 
   // Regex matching technical resolution and bitrate tokens
   private static TECHNICAL_TOKEN_REGEX =
@@ -15,17 +15,21 @@ export class ChannelNormalizer {
   private static SPAM_TRAILER_REGEX =
     /(?:buffer-free|join\s+telegram|t\.me\/|cncverse\s+bridge|stream\s+provided\s+by|donate|paypal|patreon|audio:\s*\w+|\(plays\s+in\s+mpv\)|\(recommended\)).*$/gim;
 
+  private static PROVIDER_NOISE_REGEX =
+    /\b(?:sportzx|playztv|livxow|sktech|playfy|cricify)\s*(?:provider)?\b/gi;
+
   /**
    * Normalizes raw stream name and title into a polished, canonical broadcast identity.
    */
   static normalize(rawName?: string, rawTitle?: string): { name: string; group: string } {
-    const fullText = (rawTitle || rawName || "").trim();
+    const fullText = (rawTitle || rawName || "").replace(this.EMOJI_REGEX, " ").trim();
 
     // 1. Line-Aware Channel Extraction: In Stremio scrapers (CNCVerse), the channel
     // identity line is explicitly prefixed with 🏷️ or contains the broadcaster label.
     let targetLine = "";
-    if (fullText.includes("\n")) {
-      const lines = fullText
+    const originalText = (rawTitle || rawName || "").trim();
+    if (originalText.includes("\n")) {
+      const lines = originalText
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean);
@@ -36,7 +40,7 @@ export class ChannelNormalizer {
       } else {
         // Find line containing recognized broadcaster keywords
         const broadcasterLine = lines.find((l) =>
-          /\b(sky|sony|fancode|willow|star|supersport|bein|tnt|dazn|tapmad|ptv|eurosport|astro|tamasha|prime\s*video|icc\s*tv|espn|fox|tsn|sportsnet|jio|hotstar)\b/i.test(
+          /\b(sky|sony|fancode|willow|star|supersport|bein|tnt|dazn|tapmad|ptv|eurosport|astro|tamasha|prime|icc\s*tv|espn|fox|tsn|sportsnet|jio|hotstar|redzone|nba|nhl|nfl|vix|sportv|eleven|spotv|sp0tv|auvio|sbs|apple\s*tv|ten\s*sport)\b/i.test(
             l
           )
         );
@@ -55,16 +59,18 @@ export class ChannelNormalizer {
     // 2. Remove URLs
     let input = targetLine.replace(/https?:\/\/\S+/gi, "");
 
-    // 3. Strip all emojis & country flags
+    // 3. Strip all emojis, country flags, and invisible directional marks
     input = input.replace(this.EMOJI_REGEX, " ");
 
-    // 4. Strip spam, bridge trailers, mpv notes, audio tags
+    // 4. Strip spam, bridge trailers, mpv notes, audio tags, and scraper provider prefixes
     input = input.replace(this.SPAM_TRAILER_REGEX, " ");
     input = input.replace(/\(plays\s+in\s+mpv\)/gi, " ");
+    input = input.replace(this.PROVIDER_NOISE_REGEX, " ");
 
-    // 5. Clean up special separators & whitespace
+    // 5. Clean up special separators, empty brackets, & whitespace
     input = input
-      .replace(/[•·|~:]+/g, " ")
+      .replace(/\[\s*\]|\(\s*\)/g, " ")
+      .replace(/[•·|~:[\]]+/g, " ")
       .replace(/\s+-\s+/g, " ")
       .replace(/\s+/g, " ")
       .trim();
@@ -78,6 +84,8 @@ export class ChannelNormalizer {
       upperRaw === "LOW QUALITY" ||
       upperRaw === "BACKUP SERVER" ||
       upperRaw === "SERVER" ||
+      upperRaw === "LIVE" ||
+      upperRaw === "SK LIVE" ||
       upperRaw.startsWith("SD SERVER") ||
       upperRaw.startsWith("LOW SERVER") ||
       upperRaw.startsWith("SERVER ")
@@ -98,15 +106,53 @@ export class ChannelNormalizer {
       upper === "LOW QUALITY" ||
       upper === "LOW" ||
       upper === "SERVER" ||
+      upper === "LIVE" ||
+      upper === "SK LIVE" ||
       upper.startsWith("SD SERVER") ||
       upper.startsWith("LOW SERVER") ||
       upper.startsWith("SERVER ") ||
-      /^(?:sd\s+server|hd\s+server|low\s+server|low\s+quality|server)$/i.test(upper)
+      /^(?:sd\s+server|hd\s+server|low\s+server|low\s+quality|server|live)$/i.test(upper)
     ) {
       return { name: "Standard Feed", group: "General Sports" };
     }
 
+    // --- Apple TV+ (check before Sky so "Sky via Apple TV" maps to Apple TV+) ---
+    if (upper.includes("APPLE TV")) {
+      return { name: "Apple TV+", group: "Apple TV+" };
+    }
+
+    // --- Sony Sports Network (check SONY before SKY so "SONY SKY FEED" maps to Sony) ---
+    if (upper.includes("SONY") && (upper.includes("LIV") || upper.includes("SONYLIV"))) {
+      return { name: "Sony LIV", group: "Sony Sports Network" };
+    }
+    if (/\b(?:ten\s*1|sony\s*ten\s*1)\b/i.test(upper)) {
+      return { name: "Sony Sports Ten 1", group: "Sony Sports Network" };
+    }
+    if (/\b(?:ten\s*2|sony\s*ten\s*2)\b/i.test(upper)) {
+      return { name: "Sony Sports Ten 2", group: "Sony Sports Network" };
+    }
+    if (/\b(?:ten\s*3|sony\s*ten\s*3)\b/i.test(upper)) {
+      return { name: "Sony Sports Ten 3", group: "Sony Sports Network" };
+    }
+    if (/\b(?:ten\s*4|sony\s*ten\s*4)\b/i.test(upper)) {
+      return { name: "Sony Sports Ten 4", group: "Sony Sports Network" };
+    }
+    if (/\b(?:ten\s*5|sony\s*(?:ten\s*5|six))\b/i.test(upper)) {
+      return { name: "Sony Sports Ten 5", group: "Sony Sports Network" };
+    }
+    if (upper.includes("SONY")) {
+      return { name: "Sony Sports HD", group: "Sony Sports Network" };
+    }
+
+    // --- Ten Sports ---
+    if (/\bTEN\s+SPORTS?\b/i.test(upper)) {
+      return { name: "Ten Sports HD", group: "Ten Sports" };
+    }
+
     // --- Sky Sports Network ---
+    if (upper.includes("SKY") && (upper.includes("ITALIA") || /\bIT\b/.test(upper))) {
+      return { name: "Sky Sport Italia", group: "Sky Sports" };
+    }
     if (upper.includes("SKY") && (upper.includes("TOP EVENT") || upper.includes("MAIN EVENT"))) {
       return { name: "Sky Sports Main Event", group: "Sky Sports" };
     }
@@ -139,29 +185,6 @@ export class ChannelNormalizer {
     }
     if (upper.includes("SKY SPORT") || upper.includes("SKY SPORTS")) {
       return { name: "Sky Sports HD", group: "Sky Sports" };
-    }
-
-    // --- Sony Sports Network ---
-    if (upper.includes("SONY") && (upper.includes("LIV") || upper.includes("SONYLIV"))) {
-      return { name: "Sony LIV", group: "Sony Sports Network" };
-    }
-    if (/\b(?:ten\s*1|sony\s*ten\s*1)\b/i.test(upper)) {
-      return { name: "Sony Sports Ten 1", group: "Sony Sports Network" };
-    }
-    if (/\b(?:ten\s*2|sony\s*ten\s*2)\b/i.test(upper)) {
-      return { name: "Sony Sports Ten 2", group: "Sony Sports Network" };
-    }
-    if (/\b(?:ten\s*3|sony\s*ten\s*3)\b/i.test(upper)) {
-      return { name: "Sony Sports Ten 3", group: "Sony Sports Network" };
-    }
-    if (/\b(?:ten\s*4|sony\s*ten\s*4)\b/i.test(upper)) {
-      return { name: "Sony Sports Ten 4", group: "Sony Sports Network" };
-    }
-    if (/\b(?:ten\s*5|sony\s*(?:ten\s*5|six))\b/i.test(upper)) {
-      return { name: "Sony Sports Ten 5", group: "Sony Sports Network" };
-    }
-    if (upper.includes("SONY")) {
-      return { name: "Sony Sports HD", group: "Sony Sports Network" };
     }
 
     // --- FanCode ---
@@ -250,7 +273,13 @@ export class ChannelNormalizer {
     }
 
     // --- Amazon Prime Video & ICC TV ---
-    if (upper.includes("PRIME VIDEO") || upper.includes("AMAZON PRIME")) {
+    if (
+      upper.includes("PRIME VIDEO") ||
+      upper.includes("AMAZON PRIME") ||
+      /\bPRIME(?:\s+(?:ENG|ENGLISH|HIN|HINDI|TAM|TAMIL|TEL|TELUGU|KAN|KANNADA|LIVE|SPORT|SPORTS))?\b/i.test(
+        upper
+      )
+    ) {
       return { name: "Amazon Prime Video", group: "Amazon Prime" };
     }
     if (upper.includes("ICC TV") || upper.includes("ICC.TV")) {
@@ -291,6 +320,54 @@ export class ChannelNormalizer {
       return { name: "DAZN HD", group: "DAZN" };
     }
 
+    // --- US Major League Networks (NFL / NBA / NHL / Tennis Channel) ---
+    if (upper.includes("REDZONE") || upper.includes("RED ZONE")) {
+      return { name: "NFL RedZone", group: "NFL Network" };
+    }
+    if (/\bNFL\s*(?:LIVE|NETWORK|TV)?\b/.test(upper)) {
+      return { name: "NFL Network", group: "NFL Network" };
+    }
+    if (upper.includes("LEAGUEPASS") || upper.includes("LEAGUE PASS")) {
+      return { name: "NBA League Pass", group: "NBA TV" };
+    }
+    if (/\bNBA\s*(?:LIVE|TV|USA)?\b/.test(upper)) {
+      return { name: "NBA TV", group: "NBA TV" };
+    }
+    if (/\bNHL\s*(?:LIVE|NETWORK|TV)?\b/.test(upper)) {
+      return { name: "NHL Network", group: "NHL Network" };
+    }
+    if (upper.includes("TENNIS CHANNEL") || /^TENNIS\s*\d*$/.test(upper)) {
+      return { name: "Tennis Channel", group: "Tennis Channel" };
+    }
+
+    // --- Global Sports Networks (ViX, SporTV, Eleven, SPOTV, Sport1, RTBF, SBS, Canal+) ---
+    if (/\bVIX\b/.test(upper)) {
+      return { name: "ViX Deportes", group: "ViX" };
+    }
+    if (upper.includes("SPORTV")) {
+      if (/\b3\b/.test(upper)) return { name: "SporTV 3", group: "SporTV" };
+      if (/\b2\b/.test(upper)) return { name: "SporTV 2", group: "SporTV" };
+      return { name: "SporTV Brasil", group: "SporTV" };
+    }
+    if (upper.includes("ELEVEN SPORT")) {
+      return { name: "Eleven Sports", group: "Eleven Sports" };
+    }
+    if (upper.includes("SPOTV") || upper.includes("SP0TV")) {
+      return { name: "SPOTV HD", group: "SPOTV" };
+    }
+    if (/\bSPORT\s*1\b/.test(upper)) {
+      return { name: "Sport1 Germany", group: "Sport1" };
+    }
+    if (upper.includes("AUVIO")) {
+      return { name: "RTBF Auvio", group: "RTBF" };
+    }
+    if (upper.includes("SBS SPORT")) {
+      return { name: "SBS Sports", group: "SBS Sports" };
+    }
+    if (/\bCANAL\s*(?:\+|5|SPORT)\b/.test(upper) || upper === "CANAL5") {
+      return { name: "Canal+ Sport", group: "Canal+" };
+    }
+
     // --- ESPN / Fox Sports / TSN / Sportsnet ---
     if (upper.includes("ESPN")) {
       if (upper.includes("PLUS") || upper.includes("ESPN+")) return { name: "ESPN+", group: "ESPN" };
@@ -314,13 +391,17 @@ export class ChannelNormalizer {
     // Fallback: title-case generic clean name
     let generic = input
       .replace(/\b(?:direct|stream|server\s*\d+|feed\s*\d+|bridge)\b/gi, "")
-      .replace(/[()]/g, "")
+      .replace(/[()[\]]/g, "")
       .replace(/\s+/g, " ")
       .trim();
 
     if (!generic || generic.length < 3) {
       generic = rawName ? rawName.replace(this.EMOJI_REGEX, "").trim() : "Main Live Feed";
-      generic = generic.replace(this.TECHNICAL_TOKEN_REGEX, "").trim();
+      generic = generic
+        .replace(this.PROVIDER_NOISE_REGEX, "")
+        .replace(this.TECHNICAL_TOKEN_REGEX, "")
+        .replace(/[()[\]]/g, "")
+        .trim();
     }
 
     generic = generic
@@ -336,3 +417,4 @@ export class ChannelNormalizer {
     };
   }
 }
+

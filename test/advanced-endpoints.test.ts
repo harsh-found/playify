@@ -281,6 +281,108 @@ describe("Advanced API Capabilities & Endpoints", () => {
     expect(drmFreeBody.streams[0].drm).toBeNull();
   });
 
+  it("serves /api/broadcasters discovery and preserves all multi-entry providerRawIds on /api/fixture/:id?includeStreams=true", async () => {
+    const now = Date.now();
+    const liveStart = new Date(now - 20 * 60_000).toISOString();
+    const liveEnd = new Date(now + 90 * 60_000).toISOString();
+
+    const rawId1 = encodeCncId("sportzx", {
+      eventId: "szx_1",
+      title: "New Zealand vs India",
+      formats: ["PRIME ENG"],
+      eventInfo: {
+        teamA: "New Zealand",
+        teamB: "India",
+        eventName: "One Day International",
+        eventCat: "Cricket",
+        isLive: 1,
+        startTime: liveStart,
+        endTime: liveEnd,
+      },
+    });
+    const rawId2 = encodeCncId("sportzx", {
+      eventId: "szx_2",
+      title: "New Zealand vs India (Hindi)",
+      formats: ["PRIME HINDI"],
+      eventInfo: {
+        teamA: "New Zealand",
+        teamB: "India",
+        eventName: "One Day International",
+        eventCat: "Cricket",
+        isLive: 1,
+        startTime: liveStart,
+        endTime: liveEnd,
+      },
+    });
+
+    vi.spyOn(UpstreamClient, "fetchCatalog").mockImplementation(async (catalogId: string) => {
+      if (catalogId === "cnc_SportzXLiveEvents_tv") {
+        return [
+          { id: rawId1, type: "tv", name: "New Zealand vs India" },
+          { id: rawId2, type: "tv", name: "New Zealand vs India" },
+        ];
+      }
+      return [];
+    });
+
+    vi.spyOn(UpstreamClient, "fetchStreams").mockImplementation(async (rawId: string) => {
+      if (rawId === rawId1) {
+        return [
+          {
+            name: "PRIME ENG FHD",
+            title: "Prime English 1080p",
+            url: "http://129.225.106.195/d/master.m3u8?d=https%3A%2F%2Fcdn.example.com%2Feng%2Fcenc.mpd&clearkey=0123456789abcdef0123456789abcdef:fedcba9876543210fedcba9876543210&maxh=1080",
+          },
+        ];
+      }
+      if (rawId === rawId2) {
+        return [
+          {
+            name: "PRIME HINDI FHD",
+            title: "Prime Hindi 1080p",
+            url: "https://cdn.example.com/hindi/master.mpd?clearkey=0123456789abcdef0123456789abcdef:fedcba9876543210fedcba9876543210",
+          },
+        ];
+      }
+      return [];
+    });
+
+    const bRes = await app.request("http://localhost/api/broadcasters");
+    expect(bRes.status).toBe(200);
+    const bBody = (await bRes.json()) as any;
+    expect(bBody.totalBroadcasters).toBeGreaterThanOrEqual(1);
+    expect(bBody.broadcasters[0].name).toBe("Amazon Prime Video");
+    expect(bBody.broadcasters[0].group).toBe("Amazon Prime");
+
+    const catRes = await app.request("http://localhost/api/catalog");
+    const catBody = (await catRes.json()) as any;
+    expect(catBody.fixtures).toHaveLength(1);
+    const fixtureId = catBody.fixtures[0].fixtureId;
+
+    // Verify /api/fixture/:id?includeStreams=true queries BOTH rawId1 and rawId2 from sportzx
+    const fixRes = await app.request(
+      `http://localhost/api/fixture/${encodeURIComponent(fixtureId)}?includeStreams=true`
+    );
+    expect(fixRes.status).toBe(200);
+    const fixBody = (await fixRes.json()) as any;
+    expect(fixBody.streams).toHaveLength(2);
+    expect(fixBody.streamSummary.providersBreakdown).toHaveLength(1);
+    expect(fixBody.streamSummary.providersBreakdown[0].rawIdsQueried).toBe(2);
+    expect(fixBody.streamSummary.providersBreakdown[0].rawStreamsReturned).toBe(2);
+
+    // Filter streams by playableOn=web_hls (only the bridged HLS stream is webHlsCompatible, not raw .mpd with ClearKey)
+    const webHlsRes = await app.request(
+      `http://localhost/api/stream/${encodeURIComponent(fixtureId)}?playableOn=web_hls&inspect=false`
+    );
+    expect(webHlsRes.status).toBe(200);
+    const webHlsBody = (await webHlsRes.json()) as any;
+    expect(webHlsBody.streams).toHaveLength(1);
+    expect(webHlsBody.streams[0].network.isBridgedStream).toBe(true);
+    expect(webHlsBody.streams[0].network.directOriginUrl).toBe(
+      "https://cdn.example.com/eng/cenc.mpd"
+    );
+  });
+
   it("blocks SSRF private/loopback targets on /api/proxy", async () => {
     const ssrfRes = await app.request(
       "http://localhost/api/proxy?url=" + encodeURIComponent("http://127.0.0.1:8080/admin")

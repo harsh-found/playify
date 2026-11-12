@@ -3,6 +3,7 @@ import { Aggregator } from "../src/providers/aggregator";
 import { UpstreamClient } from "../src/providers/upstream-client";
 import { EdgeCache } from "../src/core/cache";
 import { Normalizer } from "../src/core/normalizer";
+import { ChannelNormalizer } from "../src/core/channel-normalizer";
 import { EventIdentityEngine } from "../src/core/event-identity";
 import { StreamDeduplicator } from "../src/core/deduplicator";
 import { ReconciliationEngine } from "../src/core/reconciliation";
@@ -382,6 +383,155 @@ describe("Automated Reconciliation & Regression Suite", () => {
 
     expect(id1.canonicalDiscriminator).not.toBe(id2.canonicalDiscriminator);
     expect(EventIdentityEngine.areCompatible(id1, id2)).toBe(false);
+  });
+
+  it("normalizes global broadcasters, strips invisible Unicode directional marks, and cleans empty brackets", () => {
+    expect(ChannelNormalizer.normalize("PRIME ENG FHD")).toEqual({
+      name: "Amazon Prime Video",
+      group: "Amazon Prime",
+    });
+    expect(ChannelNormalizer.normalize("PRIME HINDI HD")).toEqual({
+      name: "Amazon Prime Video",
+      group: "Amazon Prime",
+    });
+    expect(ChannelNormalizer.normalize("\u200ETEN SPORTS HD")).toEqual({
+      name: "Ten Sports HD",
+      group: "Ten Sports",
+    });
+    expect(ChannelNormalizer.normalize("Nba Leaguepass")).toEqual({
+      name: "NBA League Pass",
+      group: "NBA TV",
+    });
+    expect(ChannelNormalizer.normalize("Redzone [🇺🇸]")).toEqual({
+      name: "NFL RedZone",
+      group: "NFL Network",
+    });
+    expect(ChannelNormalizer.normalize("Sportv 3 Br")).toEqual({
+      name: "SporTV 3",
+      group: "SporTV",
+    });
+    expect(ChannelNormalizer.normalize("Sky Sport 1 It")).toEqual({
+      name: "Sky Sport Italia",
+      group: "Sky Sports",
+    });
+    expect(ChannelNormalizer.normalize("Vix Deportes")).toEqual({
+      name: "ViX Deportes",
+      group: "ViX",
+    });
+  });
+
+  it("unwraps MediaFlow bridge URLs, upgrades metadata on merge, and excludes non-media JSON API URLs", () => {
+    const rawStreams = [
+      {
+        providerKey: "playztv",
+        name: "PlayztvProvider",
+        title: "Stream 1 [ ]",
+        url: "http://129.225.106.195/d/master.m3u8?d=https%3A%2F%2Fa204aivottepl-a.akamaihd.net%2Fsin-nitro%2Flive%2Fdash%2Fcenc.mpd&clearkey=0123456789abcdef0123456789abcdef:fedcba9876543210fedcba9876543210&maxh=1080",
+      },
+      {
+        providerKey: "sportzx",
+        name: "PRIME ENG FHD",
+        title: "PRIME ENG - 1080p",
+        url: "http://129.225.106.195/d/master.m3u8?d=https%3A%2F%2Fa204aivottepl-a.akamaihd.net%2Fsin-nitro%2Flive%2Fdash%2Fcenc.mpd&clearkey=0123456789abcdef0123456789abcdef:fedcba9876543210fedcba9876543210&maxh=1080",
+        behaviorHints: {
+          proxyHeaders: {
+            request: {
+              "User-Agent": "PrimeVideoPlayer/1.0",
+            },
+          },
+        },
+      },
+      {
+        providerKey: "livxow",
+        name: "Kick API",
+        title: "Kick JSON endpoint",
+        url: "https://kick.com/api/v2/channels/frankthetank/livestream",
+      },
+    ];
+
+    const report = StreamDeduplicator.deduplicateWithAudit(rawStreams);
+    expect(report.audit.excludedStreamsCount).toBe(1);
+    expect(report.audit.exclusions[0].reason).toBe("NON_MEDIA_URL");
+    expect(report.streams).toHaveLength(1);
+
+    const stream = report.streams[0];
+    // Upgraded from "Standard Feed" (playztv) to "Amazon Prime Video" (sportzx)
+    expect(stream.channelName).toBe("Amazon Prime Video");
+    expect(stream.channelGroup).toBe("Amazon Prime");
+    expect(stream.qualityVariant).toBe("1080p");
+    expect(stream.network.isBridgedStream).toBe(true);
+    expect(stream.network.directOriginUrl).toBe(
+      "https://a204aivottepl-a.akamaihd.net/sin-nitro/live/dash/cenc.mpd"
+    );
+    expect(stream.network.requiredHeaders?.["User-Agent"]).toBe("PrimeVideoPlayer/1.0");
+    expect(stream.playbackHints?.webHlsCompatible).toBe(true);
+    expect(stream.playbackHints?.directDashAvailable).toBe(true);
+    expect(stream.playbackHints?.requiresClearKey).toBe(true);
+  });
+
+  it("strips stage suffixes from tournament names while preserving stage in eventDetails, and unifies Stockholm Open", () => {
+    expect(Normalizer.normalizeTournamentName("SAFF Championship | 1st Semi-final")).toBe(
+      "SAFF Championship"
+    );
+    expect(Normalizer.normalizeTournamentName("SAFF Championship | 2nd Semi-final")).toBe(
+      "SAFF Championship"
+    );
+    expect(Normalizer.normalizeTournamentName("U19 Asia Cup | Final")).toBe("U19 Asia Cup");
+    expect(Normalizer.normalizeTournamentName("Women's Big Bash League")).toBe(
+      "Women's Big Bash League (WBBL)"
+    );
+
+    const key1 = Normalizer.computeCanonicalKey("ATP 250 vs Stockholm Open", "Tennis", {
+      teamA: "ATP 250",
+      teamB: "Stockholm Open",
+      eventName: "ATP 250 & WTA Hong Kong",
+      eventCat: "Tennis",
+    });
+    const key2 = Normalizer.computeCanonicalKey("Stockholm OPEN", "Tennis", {
+      eventName: "Stockholm OPEN",
+      eventCat: "Tennis",
+    });
+    expect(key1).toBe("tennis::stockholm-open::channel");
+    expect(key2).toBe("tennis::stockholm-open::channel");
+
+    const saffSemi = Normalizer.cascadeFixture(
+      "football::bangladesh::nepal::semi_final::m1::2026-11-12::s2",
+      [
+        {
+          providerKey: "sktech",
+          rawId: "skt_saff_1",
+          name: "Bangladesh vs Nepal",
+          sport: "Football",
+          eventInfo: {
+            teamA: "Bangladesh",
+            teamB: "Nepal",
+            eventName: "SAFF Championship | 1st Semi-final",
+            eventCat: "Football",
+            startTime: "2026-11-12T12:00:00Z",
+            endTime: "2026-11-12T14:00:00Z",
+          },
+        },
+      ]
+    );
+    expect(saffSemi.tournament.name).toBe("SAFF Championship");
+    expect(saffSemi.eventDetails?.stage).toBe("semi_final");
+
+    const f1Show = Normalizer.cascadeFixture("motorsport::formula-1::show", [
+      {
+        providerKey: "sportzx",
+        rawId: "szx_f1_lv",
+        name: "Formula 1 - Las Vegas Grand Prix",
+        sport: "Motorsport",
+        eventInfo: {
+          eventName: "Formula 1 - Las Vegas Grand Prix",
+          eventCat: "Motorsport",
+          startTime: "2026-11-12T06:00:00Z",
+          endTime: "2026-11-12T08:00:00Z",
+        },
+      },
+    ]);
+    expect(f1Show.title).toBe("Formula 1");
+    expect(f1Show.eventDetails?.stage).toBe("Las Vegas Grand Prix");
   });
 });
 
